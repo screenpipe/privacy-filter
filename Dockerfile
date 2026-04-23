@@ -31,21 +31,11 @@ ENV MODEL_DIR=/opt/model-int8
 # which takes the 1.5B-param model from ~6 GB fp32 / ~3 GB fp16 down to
 # roughly 1.5 GB on disk — fits in Tinfoil's 4 GB ramdisk after image
 # extract plus ~800 MB for alloy+ssh sidecars.
+COPY build_quantize.py /tmp/build_quantize.py
 RUN useradd --system --no-create-home --uid 10001 appuser \
-    && SOURCE_MODEL_ID=$SOURCE_MODEL_ID MODEL_DIR=$MODEL_DIR python -c "\
-import os, shutil, torch; \
-from torch.ao.quantization import quantize_dynamic; \
-from transformers import AutoModelForTokenClassification, AutoTokenizer; \
-src = os.environ['SOURCE_MODEL_ID']; \
-out = os.environ['MODEL_DIR']; \
-os.makedirs(out, exist_ok=True); \
-AutoTokenizer.from_pretrained(src, trust_remote_code=True).save_pretrained(out); \
-model = AutoModelForTokenClassification.from_pretrained(src, trust_remote_code=True, dtype=torch.float32); \
-model.eval(); \
-model_q = quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8); \
-model.config.save_pretrained(out); \
-torch.save(model_q.state_dict(), os.path.join(out, 'pytorch_model_int8.bin'))" \
-    && rm -rf /root/.cache/huggingface \
+    && SOURCE_MODEL_ID=$SOURCE_MODEL_ID MODEL_DIR=$MODEL_DIR \
+       python /tmp/build_quantize.py \
+    && rm -rf /root/.cache/huggingface /tmp/build_quantize.py \
     && chown -R appuser:appuser /opt/model-int8
 
 COPY --chown=appuser:appuser server.py .
