@@ -31,28 +31,30 @@ RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu \
 # instead of 6 GB — fits comfortably in Tinfoil's enclave ramdisk. fp16 is
 # numerically fine for token-classification (argmax over a few labels), and
 # x86 CPUs in Tinfoil's confidential-compute enclaves all support it.
+# Create the runtime user first so the download + chown + cache-cleanup
+# all happen in a single layer — otherwise `chown -R` against the model
+# files in a later RUN duplicates the whole ~3 GB weights tree into a
+# new layer and the image balloons to 6 GB+.
 ARG SOURCE_MODEL_ID=openai/privacy-filter
 ENV SOURCE_MODEL_ID=$SOURCE_MODEL_ID
 ENV MODEL_ID=/opt/model-fp16
-RUN python -c "\
+RUN useradd --system --no-create-home --uid 10001 appuser \
+    && python -c "\
 import os, shutil, torch; \
 from transformers import AutoModelForTokenClassification, AutoTokenizer; \
 src = os.environ['SOURCE_MODEL_ID']; \
 out = '/opt/model-fp16'; \
 AutoTokenizer.from_pretrained(src).save_pretrained(out); \
 AutoModelForTokenClassification.from_pretrained(src, dtype=torch.float16).save_pretrained(out, safe_serialization=True); \
-shutil.rmtree('/opt/hf-cache', ignore_errors=True)"
+shutil.rmtree('/opt/hf-cache', ignore_errors=True)" \
+    && chown -R appuser:appuser /opt/model-fp16
 
 # Runtime lookups use the local fp16 copy only — no network calls after
 # the container starts, which matches Tinfoil's attested-runtime model.
 ENV TRANSFORMERS_OFFLINE=1 \
     HF_HUB_OFFLINE=1
 
-COPY server.py .
-
-# Run as a non-root user — Tinfoil's policy prefers it and it's cheap.
-RUN useradd --system --no-create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app /opt/model-fp16
+COPY --chown=appuser:appuser server.py .
 USER appuser
 
 EXPOSE 8080
