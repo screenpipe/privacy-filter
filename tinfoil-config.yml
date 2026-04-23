@@ -21,7 +21,7 @@ containers:
     # Bump flow: dispatch release.yml → copy digest from "Print digest"
     # step → paste here → commit → push a new `v*` tag to trigger
     # tinfoil-build.yml which attests this exact digest.
-    image: "ghcr.io/screenpipe/privacy-filter:0.1.2@sha256:9c754ab6f3b2a152f69f759cc38c7c7b0f07922e20750a4070d38f48deb3570e"
+    image: "ghcr.io/screenpipe/privacy-filter:0.1.2@sha256:a5ed3ccd390c2338d74dc95a27895daca95cc66f1ac0ddb4770c3a76324f0e8a"
     env:
       - PORT: "8080"
     restart: "always"
