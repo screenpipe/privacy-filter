@@ -31,8 +31,11 @@ containers:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
       interval: "15s"
       timeout: "5s"
-      retries: 6
-      start_period: "120s"
+      retries: 10
+      # 10 min grace: anonymous HF download of the ~3 GB weights plus
+      # transformers' shard-load pass can easily exceed the old 120s
+      # budget inside the enclave's constrained egress.
+      start_period: "600s"
 
 shim:
   upstream-port: 8080
