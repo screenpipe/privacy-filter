@@ -18,9 +18,9 @@
 name: privacy-filter release
 
 on:
-  push:
-    tags:
-      - "v*"
+  # Build is decoupled from release tags: dispatch this manually to
+  # produce an image, copy the digest into tinfoil-config.yml, then push
+  # a `v*` tag which fires tinfoil-build.yml and attests the pinned image.
   workflow_dispatch: {}
 
 jobs:

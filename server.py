@@ -107,15 +107,16 @@ def _load_model() -> None:
     global _pipeline
     log.info("loading model %s", MODEL_ID)
     t0 = time.time()
+    import torch
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
-    # We intentionally load in fp32 on CPU. bf16 cuts memory but triggers
-    # SIGILL on some CPU kernels (seen on aarch64 docker VMs without
-    # AArch64-bf16 extensions), and the model is only 1.5B params so fp32
-    # still fits in ~6GB — well within Tinfoil's 16GB budget.
+    # fp16 halves weight bytes (6→3 GB image, ~3 GB RAM at runtime) and
+    # every x86 CPU Tinfoil runs on supports it natively. The aarch64
+    # SIGILL we hit before was Docker's emulation layer on Apple Silicon,
+    # not the real enclave silicon.
     model = AutoModelForTokenClassification.from_pretrained(
         MODEL_ID,
         device_map="cpu",
-        dtype="float32",
+        dtype=torch.float16,
     )
     _pipeline = pipeline(
         task="token-classification",

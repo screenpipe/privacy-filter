@@ -27,21 +27,24 @@ COPY requirements.txt .
 RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu \
         -r requirements.txt
 
-# Pre-download model weights into the baked HF cache. TRANSFORMERS_OFFLINE=1
-# above forces runtime lookups to use the cache only — no network calls
-# after the container starts, which is also what Tinfoil's attested runtime
-# expects. Override MODEL_ID via build-arg for variant builds.
-ARG MODEL_ID=openai/privacy-filter
-ENV MODEL_ID=$MODEL_ID
+# Download the model and re-save it in fp16 so the final image is ~3 GB
+# instead of 6 GB — fits comfortably in Tinfoil's enclave ramdisk. fp16 is
+# numerically fine for token-classification (argmax over a few labels), and
+# x86 CPUs in Tinfoil's confidential-compute enclaves all support it.
+ARG SOURCE_MODEL_ID=openai/privacy-filter
+ENV SOURCE_MODEL_ID=$SOURCE_MODEL_ID
+ENV MODEL_ID=/opt/model-fp16
 RUN python -c "\
+import os, shutil, torch; \
 from transformers import AutoModelForTokenClassification, AutoTokenizer; \
-import os; \
-mid = os.environ['MODEL_ID']; \
-AutoTokenizer.from_pretrained(mid); \
-AutoModelForTokenClassification.from_pretrained(mid)"
+src = os.environ['SOURCE_MODEL_ID']; \
+out = '/opt/model-fp16'; \
+AutoTokenizer.from_pretrained(src).save_pretrained(out); \
+AutoModelForTokenClassification.from_pretrained(src, dtype=torch.float16).save_pretrained(out, safe_serialization=True); \
+shutil.rmtree('/opt/hf-cache', ignore_errors=True)"
 
-# Now that the cache is populated, lock the runtime to offline mode so
-# an attacker who owns DNS can't swap weights out from under the enclave.
+# Runtime lookups use the local fp16 copy only — no network calls after
+# the container starts, which matches Tinfoil's attested-runtime model.
 ENV TRANSFORMERS_OFFLINE=1 \
     HF_HUB_OFFLINE=1
 
@@ -49,7 +52,7 @@ COPY server.py .
 
 # Run as a non-root user — Tinfoil's policy prefers it and it's cheap.
 RUN useradd --system --no-create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app /opt/hf-cache
+    && chown -R appuser:appuser /app /opt/model-fp16
 USER appuser
 
 EXPOSE 8080
