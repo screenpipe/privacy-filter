@@ -35,8 +35,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
-MODEL_ID = os.environ.get("MODEL_ID", "openai/privacy-filter")
-MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")
+MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model-int8")
+# Kept as a display-only label for /health + response metadata.
+MODEL_ID = os.environ.get("MODEL_ID", "openai/privacy-filter (int8-dynamic)")
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
 
@@ -106,20 +107,25 @@ def _load_model() -> None:
     deployment rollouts.
     """
     global _pipeline
-    log.info("loading model %s @ %s", MODEL_ID, MODEL_REVISION)
+    log.info("loading quantized model from %s", MODEL_DIR)
     t0 = time.time()
     import torch
-    tok = AutoTokenizer.from_pretrained(MODEL_ID, revision=MODEL_REVISION)
-    # fp16 halves the resident memory footprint (~3 GB vs ~6 GB) and every
-    # x86 CPU in Tinfoil enclaves supports it natively. Weights are
-    # downloaded from HF on first boot into HF_HOME — the image itself is
-    # small (~800 MB), so Tinfoil's layer extract doesn't choke on it.
-    model = AutoModelForTokenClassification.from_pretrained(
-        MODEL_ID,
-        revision=MODEL_REVISION,
-        device_map="cpu",
-        dtype=torch.float16,
+    from torch.ao.quantization import quantize_dynamic
+    from transformers import AutoConfig
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    # Build an empty fp32 skeleton, swap its Linears for quantized ones,
+    # then load the pre-quantized state dict. Safetensors can't encode
+    # qint8 tensors so the file is a plain torch pickle.
+    cfg = AutoConfig.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    model = AutoModelForTokenClassification.from_config(cfg, trust_remote_code=True)
+    model = quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+    state = torch.load(
+        os.path.join(MODEL_DIR, "pytorch_model_int8.bin"),
+        map_location="cpu",
+        weights_only=False,
     )
+    model.load_state_dict(state)
+    model.eval()
     _pipeline = pipeline(
         task="token-classification",
         model=model,
