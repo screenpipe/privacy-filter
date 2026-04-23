@@ -15,7 +15,7 @@ cvm-version: 0.7.5
 # (compressed + extracted), so 16 GB total was not enough headroom and
 # pulls were failing with "failed to send write" during ingest.
 cpus: 8
-memory: 32768
+memory: 16384
 
 containers:
   - name: privacy-filter
@@ -23,7 +23,7 @@ containers:
     # Bump flow: dispatch release.yml → copy digest from "Print digest"
     # step → paste here → commit → push a new `v*` tag to trigger
     # tinfoil-build.yml which attests this exact digest.
-    image: "ghcr.io/screenpipe/privacy-filter:0.1.4@sha256:aa66467dbdc2df8e7f26bc35c229b051d2f5458868f5da5f511e71e9f8dd9cf0"
+    image: "ghcr.io/screenpipe/privacy-filter:0.1.6@sha256:3a0c5dd41a536e1b248b6548b5f3448bec03858971cb4f13d41e139ae8b70e6d"
     env:
       - PORT: "8080"
     restart: "always"
