@@ -109,22 +109,32 @@ def _load_model() -> None:
     global _pipeline
     log.info("loading quantized model from %s", MODEL_DIR)
     t0 = time.time()
+    import json
     import torch
-    from torch.ao.quantization import quantize_dynamic
+    from safetensors.torch import load_file
     from transformers import AutoConfig
     tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    # Build an empty fp32 skeleton, swap its Linears for quantized ones,
-    # then load the pre-quantized state dict. Safetensors can't encode
-    # qint8 tensors so the file is a plain torch pickle.
     cfg = AutoConfig.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    # Build the model as fp16 empty skeleton, then overwrite every
+    # tensor with dequantized weights from the int8 + scales payload.
     model = AutoModelForTokenClassification.from_config(cfg, trust_remote_code=True)
-    model = quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
-    state = torch.load(
-        os.path.join(MODEL_DIR, "pytorch_model_int8.bin"),
-        map_location="cpu",
-        weights_only=False,
-    )
-    model.load_state_dict(state)
+    model = model.to(torch.float16)
+
+    raw = load_file(os.path.join(MODEL_DIR, "model.safetensors"))
+    with open(os.path.join(MODEL_DIR, "quant_scales.json"), "r") as f:
+        scales = json.load(f)
+
+    target = model.state_dict()
+    dequant = {}
+    for name, tensor in raw.items():
+        if name in scales:
+            # int8 → fp16 via per-tensor scale.
+            dequant[name] = (tensor.to(torch.float32) * scales[name]).to(torch.float16)
+        else:
+            dequant[name] = tensor.to(target[name].dtype) if name in target else tensor
+    del raw
+    model.load_state_dict(dequant, strict=False)
+    del dequant
     model.eval()
     _pipeline = pipeline(
         task="token-classification",
