@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
 MODEL_ID = os.environ.get("MODEL_ID", "openai/privacy-filter")
+MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
 
@@ -105,16 +106,17 @@ def _load_model() -> None:
     deployment rollouts.
     """
     global _pipeline
-    log.info("loading model %s", MODEL_ID)
+    log.info("loading model %s @ %s", MODEL_ID, MODEL_REVISION)
     t0 = time.time()
     import torch
-    tok = AutoTokenizer.from_pretrained(MODEL_ID)
-    # fp16 halves weight bytes (6→3 GB image, ~3 GB RAM at runtime) and
-    # every x86 CPU Tinfoil runs on supports it natively. The aarch64
-    # SIGILL we hit before was Docker's emulation layer on Apple Silicon,
-    # not the real enclave silicon.
+    tok = AutoTokenizer.from_pretrained(MODEL_ID, revision=MODEL_REVISION)
+    # fp16 halves the resident memory footprint (~3 GB vs ~6 GB) and every
+    # x86 CPU in Tinfoil enclaves supports it natively. Weights are
+    # downloaded from HF on first boot into HF_HOME — the image itself is
+    # small (~800 MB), so Tinfoil's layer extract doesn't choke on it.
     model = AutoModelForTokenClassification.from_pretrained(
         MODEL_ID,
+        revision=MODEL_REVISION,
         device_map="cpu",
         dtype=torch.float16,
     )
