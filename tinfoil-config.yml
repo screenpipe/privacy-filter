@@ -9,13 +9,18 @@
 
 cvm-version: 0.7.5
 
-# No GPU: the model's MoE has only 50M active params per token and banded
-# attention keeps it O(N). 8 vCPU with 32 GB — the image is ~3.5 GB uncompressed
-# and Tinfoil's enclave ramdisk needs ~2× that during `docker pull`
-# (compressed + extracted), so 16 GB total was not enough headroom and
-# pulls were failing with "failed to send write" during ingest.
+# No GPU: the OPF model's MoE has only 50M active params per token and
+# banded attention keeps it O(N). The added rfdetr_v8 image detector is
+# tiny (~25M params, FP32 ONNX baked at 108 MB) and runs sequentially
+# on the same vCPUs.
+#
+# 8 vCPU. Memory bumped from 16 → 24 GB to leave headroom for the
+# additional image model session + decoded image buffers (PIL holds a
+# decoded RGB version of every inference's input plus a 320×320 resize).
+# Pulls failed at 16 GB once we tipped over ~3.5 GB image size; 24 GB
+# gives a comfortable 2× extract margin without renting more capacity.
 cpus: 8
-memory: 16384
+memory: 24576
 
 containers:
   - name: privacy-filter
@@ -39,8 +44,10 @@ containers:
 
 shim:
   upstream-port: 8080
-  # Only /health and /filter are reachable from outside the enclave. Any
-  # other path is rejected with 404 — no debug/introspection leaks.
+  # Only /health, /filter (text), and /image/detect (image) are reachable
+  # from outside the enclave. Any other path is rejected with 404 — no
+  # debug/introspection leaks.
   paths:
     - /health
     - /filter
+    - /image/detect
