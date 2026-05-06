@@ -38,6 +38,20 @@ RUN useradd --system --no-create-home --uid 10001 appuser \
     && rm -rf /root/.cache/huggingface /tmp/build_quantize.py \
     && chown -R appuser:appuser /opt/model-int8
 
+# Bake the image-PII detector. Same auto-download pattern as the
+# desktop client — pulled from the public HF repo, SHA-256 verified
+# at build time so the resulting image hash is reproducible. ~108 MB
+# FP32; comfortably under the ramdisk budget already established for
+# the text model.
+ARG IMAGE_MODEL_HF_REPO=screenpipe/pii-image-redactor
+ARG IMAGE_MODEL_HF_FILE=rfdetr_v8.onnx
+ARG IMAGE_MODEL_SHA256=431acc0f0beb22a39572b7a50af4fc446e799840fb71320dc124fbd79a121eb3
+ENV IMAGE_MODEL_PATH=/opt/rfdetr_v8.onnx
+ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
+    https://huggingface.co/${IMAGE_MODEL_HF_REPO}/resolve/main/${IMAGE_MODEL_HF_FILE} \
+    ${IMAGE_MODEL_PATH}
+RUN chown appuser:appuser ${IMAGE_MODEL_PATH}
+
 COPY --chown=appuser:appuser server.py .
 USER appuser
 

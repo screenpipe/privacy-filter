@@ -11,3 +11,10 @@ transformers==5.6.0
 tokenizers==0.22.1
 accelerate==1.1.1
 safetensors==0.4.5
+# Image-PII detector (rfdetr_v8). CPU-only ONNX Runtime — same EP
+# story as the Mac/Win client builds, just running server-side here.
+onnxruntime==1.20.1
+pillow==11.0.0
+# numpy is pulled in transitively by torch but pin it explicitly so a
+# torch minor bump can't drift the version we test against.
+numpy==2.1.3
