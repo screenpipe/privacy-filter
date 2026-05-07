@@ -1,9 +1,8 @@
 fastapi==0.115.4
 uvicorn[standard]==0.32.0
 pydantic==2.9.2
-# CPU-only torch wheels — picked up from the CPU index in the Dockerfile
-# (--extra-index-url). Pinning the minor version prevents unexpected
-# perf/ABI changes from sneaking into the image on rebuilds.
+# CUDA-enabled torch wheels from PyPI — bundled with CUDA 12.4 runtime,
+# matching the nvidia/cuda:12.4.1-cudnn-runtime base image.
 torch==2.5.1
 # openai/privacy-filter ships a custom `OpenAIPrivacyFilterForTokenClassification`
 # arch + `TokenizersBackend` tokenizer class; both require transformers >= 5.x.
@@ -11,9 +10,9 @@ transformers==5.6.0
 tokenizers==0.22.1
 accelerate==1.1.1
 safetensors==0.4.5
-# Image-PII detector (rfdetr_v8). CPU-only ONNX Runtime — same EP
-# story as the Mac/Win client builds, just running server-side here.
-onnxruntime==1.20.1
+# rfdetr_v8 image-PII detector. GPU EP via CUDA + TensorRT (the gpu
+# wheel includes CPUExecutionProvider as a final fallback).
+onnxruntime-gpu==1.20.1
 pillow==11.0.0
 # numpy is pulled in transitively by torch but pin it explicitly so a
 # torch minor bump can't drift the version we test against.
