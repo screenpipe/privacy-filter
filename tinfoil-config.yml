@@ -14,13 +14,14 @@ cvm-version: 0.7.5
 # tiny (~25M params, FP32 ONNX baked at 108 MB) and runs sequentially
 # on the same vCPUs.
 #
-# 8 vCPU. Memory bumped from 16 → 24 GB to leave headroom for the
-# additional image model session + decoded image buffers (PIL holds a
-# decoded RGB version of every inference's input plus a 320×320 resize).
-# Pulls failed at 16 GB once we tipped over ~3.5 GB image size; 24 GB
-# gives a comfortable 2× extract margin without renting more capacity.
+# 8 vCPU. Memory bumped to 32 GB to leave headroom for the additional
+# image model session + decoded image buffers (PIL holds a decoded RGB
+# version of every inference's input plus a 320×320 resize). Pulls
+# failed at 16 GB once we tipped over ~3.5 GB image size, so we'd
+# previously set 24 GB — but Tinfoil only accepts specific memory tiers
+# (2048 / 4096 / 8192 / 16384 / 32768 / …), so we round up to 32 GB.
 cpus: 8
-memory: 24576
+memory: 32768
 
 containers:
   - name: privacy-filter
