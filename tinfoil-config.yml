@@ -9,19 +9,18 @@
 
 cvm-version: 0.7.5
 
-# No GPU: the OPF model's MoE has only 50M active params per token and
-# banded attention keeps it O(N). The added rfdetr_v8 image detector is
-# tiny (~25M params, FP32 ONNX baked at 108 MB) and runs sequentially
-# on the same vCPUs.
+# 1 GPU. Tinfoil's NVIDIA confidential-compute pool (H100 / H200 in
+# CC mode behind an AMD SEV-SNP CVM). The 1.5B-param OPF text model
+# runs at BF16 (~3 GB VRAM) and the rfdetr_v8 ONNX runs on the
+# TensorRT/CUDA EP — both fit comfortably in 80 GB H100 VRAM with
+# room for input buffers and CUDA workspace.
 #
-# 8 vCPU. Memory bumped to 32 GB to leave headroom for the additional
-# image model session + decoded image buffers (PIL holds a decoded RGB
-# version of every inference's input plus a 320×320 resize). Pulls
-# failed at 16 GB once we tipped over ~3.5 GB image size, so we'd
-# previously set 24 GB — but Tinfoil only accepts specific memory tiers
-# (2048 / 4096 / 8192 / 16384 / 32768 / …), so we round up to 32 GB.
+# 8 vCPU is plenty since the GPU does the heavy lifting. Memory at
+# 32 GB covers transformers' Python-side activations, image-decode
+# buffers, and CUDA driver overhead.
 cpus: 8
 memory: 32768
+gpus: 1
 
 containers:
   - name: privacy-filter
@@ -29,7 +28,13 @@ containers:
     # Bump flow: dispatch release.yml → copy digest from "Print digest"
     # step → paste here → commit → push a new `v*` tag to trigger
     # tinfoil-build.yml which attests this exact digest.
-    image: "ghcr.io/screenpipe/privacy-filter:0.1.7@sha256:a8aaf9c4f35de4442237693f97e2eb1bc193a5c26f6d0d4da6d2d126f33b7a5b"
+    image: "ghcr.io/screenpipe/privacy-filter:0.2.0@sha256:0ef5d814d720f40c24fe12ae8dc886267a0af4cda84b731adf8763aea4bb1e9c"
+    runtime: nvidia
+    gpus: all
+    # ipc:host is required by some CUDA workloads (PyTorch's shared-mem
+    # tensor pool, NCCL collectives) — set it to match Tinfoil's other
+    # GPU containers (e.g. confidential-gemma4-31b) and avoid surprises.
+    ipc: host
     env:
       - PORT: "8080"
     restart: "always"
@@ -38,9 +43,10 @@ containers:
       interval: "15s"
       timeout: "5s"
       retries: 10
-      # 10 min grace: anonymous HF download of the ~3 GB weights plus
-      # transformers' shard-load pass can easily exceed the old 120s
-      # budget inside the enclave's constrained egress.
+      # 10 min grace: even with weights baked into the image, first
+      # boot pays a CUDA context init + TensorRT engine warm-up cost
+      # for rfdetr_v8 the first time it sees a 320×320 input. Plus the
+      # bf16 text-model weight load to VRAM (~3 GB at H100 PCIe rates).
       start_period: "600s"
 
 shim:

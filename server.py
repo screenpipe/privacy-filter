@@ -27,9 +27,9 @@ Endpoints:
 
 Design choices:
     - Both models loaded once at process start.
-    - CPU-only inference: OPF MoE-50M-active is cheap; rfdetr_v8 is
-      tiny (25M params). H200 deployment future-proofs against scale,
-      but CPU-only fits Tinfoil's existing ramdisk + 8-vCPU profile.
+    - GPU inference (H100 / H200): text model runs at BF16 (~3 GB VRAM);
+      image model runs through ONNX Runtime's TensorRT EP (CUDA fallback,
+      then CPU as a last-resort safety net).
     - Replaced PII is tagged as [LABEL] (text) or returned as bbox+
       label (image). The downstream client decides how to render.
     - Memory ceiling enforced via MAX_INPUT_TOKENS / MAX_IMAGE_BYTES
@@ -47,9 +47,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model-int8")
+MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
-MODEL_ID = os.environ.get("MODEL_ID", "openai/privacy-filter (int8-dynamic)")
+MODEL_ID = os.environ.get("MODEL_ID", "openai/privacy-filter (bf16-cuda)")
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
 
@@ -143,9 +143,10 @@ class DetectResponse(BaseModel):
 app = FastAPI(
     title="screenpipe privacy-filter",
     description=(
-        "CPU-only token-classification service that masks PII in text before "
-        "it's forwarded to an external LLM. Intended to run inside a Tinfoil "
-        "confidential enclave."
+        "GPU-accelerated token-classification + image-PII service that masks "
+        "PII in text and screenshots before they're forwarded to an external "
+        "LLM. Intended to run inside a Tinfoil confidential enclave on an "
+        "H100/H200 host (CC mode behind an AMD SEV-SNP CVM)."
     ),
 )
 
@@ -164,43 +165,40 @@ def _load_model() -> None:
     deployment rollouts.
     """
     global _pipeline
-    log.info("loading quantized model from %s", MODEL_DIR)
+    log.info("loading bf16 model from %s onto CUDA", MODEL_DIR)
     t0 = time.time()
-    import json
     import torch
-    from safetensors.torch import load_file
-    from transformers import AutoConfig
+    if not torch.cuda.is_available():
+        # Fail loud rather than silently fall back to CPU — a CPU
+        # fallback would still serve correct PII results, but the whole
+        # point of this build is the GPU speedup, so a missing device
+        # is a deploy-config bug we want to surface immediately.
+        raise RuntimeError(
+            "torch.cuda.is_available() is False — this image expects a "
+            "CUDA-capable host. Check tinfoil-config.yml has gpus:1 + "
+            "runtime:nvidia + gpus:all on the container."
+        )
     tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    cfg = AutoConfig.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    # Build the model as fp16 empty skeleton, then overwrite every
-    # tensor with dequantized weights from the int8 + scales payload.
-    model = AutoModelForTokenClassification.from_config(cfg, trust_remote_code=True)
-    model = model.to(torch.float16)
-
-    raw = load_file(os.path.join(MODEL_DIR, "model.safetensors"))
-    with open(os.path.join(MODEL_DIR, "quant_scales.json"), "r") as f:
-        scales = json.load(f)
-
-    target = model.state_dict()
-    dequant = {}
-    for name, tensor in raw.items():
-        if name in scales:
-            # int8 → fp16 via per-tensor scale.
-            dequant[name] = (tensor.to(torch.float32) * scales[name]).to(torch.float16)
-        else:
-            dequant[name] = tensor.to(target[name].dtype) if name in target else tensor
-    del raw
-    model.load_state_dict(dequant, strict=False)
-    del dequant
+    model = AutoModelForTokenClassification.from_pretrained(
+        MODEL_DIR,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        device_map="cuda",
+    )
     model.eval()
     _pipeline = pipeline(
         task="token-classification",
         model=model,
         tokenizer=tok,
         aggregation_strategy="simple",
-        device=-1,  # CPU
+        device=0,  # CUDA:0
     )
-    log.info("text model loaded in %.1fs", time.time() - t0)
+    log.info(
+        "text model loaded in %.1fs (device=%s, dtype=%s)",
+        time.time() - t0,
+        next(model.parameters()).device,
+        next(model.parameters()).dtype,
+    )
 
 
 @app.on_event("startup")
@@ -220,21 +218,39 @@ def _load_image_model() -> None:
             IMAGE_MODEL_PATH,
         )
         return
-    log.info("loading image model from %s", IMAGE_MODEL_PATH)
+    log.info("loading image model from %s onto CUDA EP", IMAGE_MODEL_PATH)
     t0 = time.time()
     import onnxruntime as ort
 
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    # Single-thread on CPU is empirically fastest for rfdetr_v8 — extra
-    # threads thrash the L2 cache without speedup at this model size.
-    opts.intra_op_num_threads = int(os.environ.get("IMAGE_INTRA_THREADS", "1"))
+    # GPU EP order — TensorRT first (compiles the graph for the device,
+    # ~5× faster on rfdetr_v8 once warmed up), then CUDA as a fallback
+    # while TensorRT engine cache is cold, then CPU as a final safety
+    # net so a misconfigured deploy doesn't hard-fail at boot.
+    providers = [
+        "TensorrtExecutionProvider",
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
     _image_session = ort.InferenceSession(
         IMAGE_MODEL_PATH,
         opts,
-        providers=["CPUExecutionProvider"],
+        providers=providers,
     )
-    log.info("image model loaded in %.1fs", time.time() - t0)
+    active = _image_session.get_providers()[0]
+    log.info(
+        "image model loaded in %.1fs (provider=%s, requested=%s)",
+        time.time() - t0,
+        active,
+        providers,
+    )
+    if active == "CPUExecutionProvider":
+        log.warning(
+            "image model is running on CPU — neither TensorRT nor CUDA "
+            "providers initialized. Inference will work but at ~5× the "
+            "latency. Check the onnxruntime-gpu wheel + GPU driver."
+        )
 
 
 @app.get("/health")

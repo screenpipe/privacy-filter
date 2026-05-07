@@ -86,31 +86,31 @@ First build pre-downloads the 1.5B text model (~3 GB bf16) AND the 108 MB rfdetr
 4. **Verify** — the service is now reachable at
    `https://privacy-filter.<org>.containers.tinfoil.dev/health`.
 
-## Resource sizing (why no GPU yet)
+## Resource sizing (GPU)
 
-**Text model (OPF):**
+**Text model (OPF) — BF16 on CUDA:**
 
 | Metric | Value |
 |---|---|
-| Weights (bf16) | ~3 GB |
+| Weights (BF16) | ~3 GB VRAM |
 | Active params per token | 50 M (MoE top-4 of 128 experts) |
 | Attention window | 257 tokens (banded, O(N)) |
-| CPU latency (512 tokens) | ~400–800 ms |
-| CPU latency (~2 KB OCR row, 600 tok) | ~3 s |
+| H100 latency (512 tokens) | ~50–100 ms |
+| H100 latency (~2 KB OCR row, 600 tok) | ~150–300 ms |
 
-**Image model (rfdetr_v8):**
+**Image model (rfdetr_v8) — TensorRT/CUDA EP:**
 
 | Metric | Value |
 |---|---|
 | Weights (FP32 ONNX) | 108 MB |
 | Params | ~25 M |
 | Input resolution | 320×320 |
-| CPU latency (per frame) | ~140 ms |
+| H100 latency (per frame) | ~25–35 ms |
 | Bench accuracy | 95.3% zero-leak / 0% oversmash on screenpipe-pii-bench-image val |
 
-**Combined runtime** (16 GB → 24 GB enclave): ~5 GB working set, ~20 req/sec short-text or ~7 frames/sec sequential image, more if interleaved.
+**Combined runtime** (32 GB CVM RAM + 80 GB H100 VRAM): ~5 GB GPU working set, ~30 req/sec short-text or ~30 frames/sec image, more if interleaved.
 
-Bump to GPU (e.g. `gpus: 1` + `runtime: nvidia` on H200) if production p95 latency exceeds your SLO. Image model would benefit ~5×, text model ~10× on H200.
+The CPU-only build (preserved on git history before v0.2.0) was the original deploy target — fits 8 vCPU / 32 GB RAM but at ~10× the latency. Switch back if cost dominates and the worker queue isn't backing up.
 
 ## Security properties
 
