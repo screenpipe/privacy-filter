@@ -57,12 +57,13 @@ MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
 # Path to the ONNX. Baked in by the Dockerfile from
 # huggingface.co/screenpipe/pii-image-redactor.
 IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v8.onnx")
-IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v8")
+IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v9")
 # Reject images larger than this (decoded). Defends against an
 # adversarial 100-MB JPEG of a 50K×50K canvas blowing up enclave RAM.
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", "20000000"))  # 20 MB
-# rfdetr_v8 was exported at fixed 320×320; keep in sync if we re-export.
-IMAGE_INPUT_SIZE = 320
+# rfdetr_v9 was exported at fixed 384×384 (the rfdetr-nano pretrained
+# backbone ships position embeddings for 384). Keep in sync if we re-export.
+IMAGE_INPUT_SIZE = 384
 IMAGE_NUM_QUERIES = 300
 # Same 12-class taxonomy as screenpipe-pii-bench-image / src/score.py.
 # Order MUST match the model's class-id ordering (see

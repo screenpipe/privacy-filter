@@ -54,8 +54,8 @@ RUN useradd --system --no-create-home --uid 10001 appuser \
 # baked at build time with SHA-256 verification so the resulting image
 # hash is reproducible.
 ARG IMAGE_MODEL_HF_REPO=screenpipe/pii-image-redactor
-ARG IMAGE_MODEL_HF_FILE=rfdetr_v8.onnx
-ARG IMAGE_MODEL_SHA256=431acc0f0beb22a39572b7a50af4fc446e799840fb71320dc124fbd79a121eb3
+ARG IMAGE_MODEL_HF_FILE=rfdetr_v9.onnx
+ARG IMAGE_MODEL_SHA256=179a5e08ab12bfc70ff1e8dc1e2a67379de2a3be93eb2e7e1f8ec3dbd973f662
 ENV IMAGE_MODEL_PATH=/opt/rfdetr_v8.onnx
 ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
     https://huggingface.co/${IMAGE_MODEL_HF_REPO}/resolve/main/${IMAGE_MODEL_HF_FILE} \
