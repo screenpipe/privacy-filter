@@ -253,6 +253,30 @@ def _load_image_model() -> None:
             "latency. Check the onnxruntime-gpu wheel + GPU driver."
         )
 
+    # TensorRT engine build on first inference takes ~50 s for a 384×384
+    # input — paying it during startup keeps it inside the container's
+    # start_period grace window instead of the first user request. Live
+    # bench against v0.3.1 measured first /image/detect at 56 s, then
+    # ~10 ms steady-state. Without warmup that ~50 s tax lands on every
+    # cold-route deploy or restart.
+    import numpy as np
+
+    warm_t0 = time.time()
+    dummy = np.zeros(
+        (1, 3, IMAGE_INPUT_SIZE, IMAGE_INPUT_SIZE), dtype=np.float32
+    )
+    try:
+        _image_session.run(None, {_image_session.get_inputs()[0].name: dummy})
+        log.info(
+            "image model warmup completed in %.1fs (TRT engine cached)",
+            time.time() - warm_t0,
+        )
+    except Exception as e:
+        # Warmup is best-effort — if it fails for some reason we'd rather
+        # keep serving than fail boot. The first real request will eat
+        # whatever build cost remains.
+        log.warning("image model warmup failed (will retry on first request): %s", e)
+
 
 @app.get("/health")
 def health() -> dict:
