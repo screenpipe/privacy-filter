@@ -16,10 +16,11 @@ cvm-version: 0.7.5
 # room for input buffers and CUDA workspace.
 #
 # 8 vCPU is plenty since the GPU does the heavy lifting. Memory at
-# 32 GB covers transformers' Python-side activations, image-decode
-# buffers, and CUDA driver overhead.
+# 64 GB (doubled from 32 GB) — needed to pull in the Docker image and
+# model on Tinfoil's ramdisk-backed deploy path. Per Tanya@Tinfoil:
+# 32 GB wasn't enough for the v0.3.0 image+model pull.
 cpus: 8
-memory: 32768
+memory: 65536
 gpus: 1
 
 containers:
