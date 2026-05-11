@@ -384,11 +384,22 @@ def _pipeline_on_batch(texts: List[str]) -> List[List[dict]]:
     """Thread-pool wrapper around the HF pipeline that always returns a
     list-of-lists, even for a 1-element batch.
 
+    Critical: pass `batch_size=len(texts)` so the pipeline actually
+    pads + runs ONE forward pass for the whole list. Without it, HF's
+    token-classification pipeline iterates the list and runs N sequential
+    forward passes — the queue-level batching collects requests but the
+    GPU still sees them one at a time, so throughput stays at the
+    single-stream ceiling. v0.3.2 shipped without this kwarg and a
+    concurrent-probe confirmed: 4 parallel requests landed within
+    270 ms of each other (collected by the batcher) but server_ms was
+    ~1500 ms per request (4× the single-request cost), i.e. 4 sequential
+    forward passes inside one Python call. Setting batch_size fixes it.
+
     The pipeline returns one flat list of spans when given a single
     string and a list-of-lists when given a list — we normalize so the
     worker's zip(futs, results) always lines up.
     """
-    raw = _pipeline(texts)
+    raw = _pipeline(texts, batch_size=len(texts))
     # 1-element batch: pipeline may unwrap to a flat list of dicts.
     if len(texts) == 1 and raw and isinstance(raw[0], dict):
         return [raw]
