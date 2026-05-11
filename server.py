@@ -38,10 +38,11 @@ Design choices:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
-from typing import List
+from typing import List, Tuple
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -52,6 +53,21 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 MODEL_ID = os.environ.get("MODEL_ID", "openai/privacy-filter (bf16-cuda)")
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
+# Dynamic batching for /filter. The HF token-classification pipeline
+# pads + runs one CUDA forward pass per batch, so grouping concurrent
+# requests is ~free up to a memory ceiling. Live v0.3.1 bench showed a
+# single-stream ceiling of ~2.5 rps with p50 ~400 ms; batching is what
+# unlocks GPU utilization above that.
+#   BATCH_WINDOW_MS — how long to wait for more requests after the first
+#                     one lands. 30 ms taxes single-request p50 by ~30 ms
+#                     in the no-load case (≈8 % of total) and is well
+#                     under typical client perception threshold.
+#   BATCH_MAX_SIZE  — max requests fused into one forward pass. Larger
+#                     ≈ better throughput but more head-of-line latency
+#                     for the first item; 16 is a safe ceiling for the
+#                     1.5B-param model on 80 GB H100/H200.
+BATCH_WINDOW_MS = int(os.environ.get("BATCH_WINDOW_MS", "30"))
+BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", "16"))
 
 # ── Image-PII detector (rfdetr_v8) ──────────────────────────────────────
 # Path to the ONNX. Baked in by the Dockerfile from
@@ -155,6 +171,11 @@ app = FastAPI(
 _pipeline = None
 # rfdetr_v8 ONNX session — loaded alongside the text model at startup.
 _image_session = None
+
+# Dynamic-batching state. Initialized in the startup hook so the queue
+# is bound to FastAPI's running event loop.
+_text_batch_queue: "asyncio.Queue[Tuple[str, asyncio.Future]] | None" = None
+_text_batch_task: "asyncio.Task | None" = None
 
 
 @app.on_event("startup")
@@ -278,6 +299,102 @@ def _load_image_model() -> None:
         log.warning("image model warmup failed (will retry on first request): %s", e)
 
 
+@app.on_event("startup")
+async def _start_text_batcher() -> None:
+    """Spin up the dynamic-batching worker for /filter.
+
+    Must run AFTER `_load_model` because the worker calls into the
+    global `_pipeline`. FastAPI runs startup hooks in registration
+    order, so this is fine as long as we keep it below `_load_model`.
+    """
+    global _text_batch_queue, _text_batch_task
+    _text_batch_queue = asyncio.Queue()
+    _text_batch_task = asyncio.create_task(_text_batch_worker())
+    log.info(
+        "text batcher started (window=%dms, max_size=%d)",
+        BATCH_WINDOW_MS,
+        BATCH_MAX_SIZE,
+    )
+
+
+async def _text_batch_worker() -> None:
+    """Pull /filter requests off the queue, fuse up to BATCH_MAX_SIZE
+    into one HF-pipeline forward pass, then scatter raw spans back to
+    each awaiter's future.
+
+    The HF token-classification pipeline accepts a list of texts and
+    returns a list of span-lists, padding to the longest text in the
+    batch and running a single CUDA forward pass. That's the bit that
+    breaks the single-stream rps ceiling.
+
+    Why a worker instead of `BackgroundTasks`: BackgroundTasks fire
+    after the response — we need the response to wait on the result.
+    A queue+worker also gives us natural backpressure: if the worker
+    falls behind, awaits stack up, and clients see latency rise
+    (preferable to dropped requests or unbounded RAM growth).
+    """
+    assert _text_batch_queue is not None
+    loop = asyncio.get_running_loop()
+    while True:
+        first = await _text_batch_queue.get()
+        batch: List[Tuple[str, asyncio.Future]] = [first]
+        deadline = loop.time() + BATCH_WINDOW_MS / 1000.0
+        while len(batch) < BATCH_MAX_SIZE:
+            timeout = deadline - loop.time()
+            if timeout <= 0:
+                break
+            try:
+                item = await asyncio.wait_for(
+                    _text_batch_queue.get(), timeout=timeout
+                )
+                batch.append(item)
+            except asyncio.TimeoutError:
+                break
+
+        texts = [t for t, _ in batch]
+        futs = [f for _, f in batch]
+        t0 = time.time()
+        try:
+            # Run the pipeline in the default thread executor — GPU
+            # inference blocks for hundreds of ms and would otherwise
+            # block the asyncio loop (no more requests get queued
+            # while the GPU is busy, defeating the point of batching).
+            results = await loop.run_in_executor(
+                None, _pipeline_on_batch, texts
+            )
+            elapsed_ms = (time.time() - t0) * 1000
+            if len(batch) > 1:
+                log.info(
+                    "batched %d /filter requests in %.0f ms (%.1f ms/req)",
+                    len(batch),
+                    elapsed_ms,
+                    elapsed_ms / len(batch),
+                )
+            for fut, res in zip(futs, results):
+                if not fut.done():
+                    fut.set_result(res)
+        except Exception as e:
+            log.exception("batched inference failed")
+            for fut in futs:
+                if not fut.done():
+                    fut.set_exception(e)
+
+
+def _pipeline_on_batch(texts: List[str]) -> List[List[dict]]:
+    """Thread-pool wrapper around the HF pipeline that always returns a
+    list-of-lists, even for a 1-element batch.
+
+    The pipeline returns one flat list of spans when given a single
+    string and a list-of-lists when given a list — we normalize so the
+    worker's zip(futs, results) always lines up.
+    """
+    raw = _pipeline(texts)
+    # 1-element batch: pipeline may unwrap to a flat list of dicts.
+    if len(texts) == 1 and raw and isinstance(raw[0], dict):
+        return [raw]
+    return raw
+
+
 @app.get("/health")
 def health() -> dict:
     return {
@@ -290,8 +407,8 @@ def health() -> dict:
 
 
 @app.post("/filter", response_model=FilterResponse)
-def filter_pii(req: FilterRequest) -> FilterResponse:
-    if _pipeline is None:
+async def filter_pii(req: FilterRequest) -> FilterResponse:
+    if _pipeline is None or _text_batch_queue is None:
         # Should never happen if startup ran to completion, but guard anyway —
         # Tinfoil may route traffic before our startup hook finishes on first boot.
         raise HTTPException(status_code=503, detail="model not loaded yet")
@@ -304,13 +421,16 @@ def filter_pii(req: FilterRequest) -> FilterResponse:
         )
 
     t0 = time.time()
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    # Hand off to the dynamic batcher and await our slot in the next
+    # batch. The worker runs the actual HF pipeline on a background
+    # thread so this await doesn't pin the event loop. char → token
+    # ratio is roughly 4:1 so 100K chars ≈ 25K tokens, well under the
+    # tokenizer's 128K cap.
+    await _text_batch_queue.put((text, fut))
     try:
-        # Transformers 5 dropped the truncation/max_length kwargs from the
-        # token-classification pipeline; truncation is now controlled by
-        # the tokenizer's model_max_length. We guard at the character level
-        # (MAX_INPUT_CHARS) above, and the char → token ratio is roughly
-        # 4:1 so 100K chars ≈ 25K tokens which is well under the 128K cap.
-        raw_spans = _pipeline(text)
+        raw_spans = await fut
     except Exception as e:
         log.exception("inference failed")
         raise HTTPException(status_code=500, detail=f"inference error: {e}")
