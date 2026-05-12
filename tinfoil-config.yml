@@ -7,39 +7,29 @@
 # the image at the pinned digest, runs remote attestation, and exposes the
 # service at https://<name>.<org>.containers.tinfoil.dev.
 #
-# ── v0.5.0: add Gemma 4 E4B (audio + vision) alongside the 31B ─────────
-# One image, one Tinfoil container, one shim, THREE GPU workloads sharing
-# the H200 (~141 GB VRAM):
-#   1. privacy-filter        (text PII + image PII)               ~16 GB
-#   2. Gemma 4 31B  (vLLM)   chat + vision      ~62 GB weights
-#      + KV cache pool at --gpu-memory-utilization 0.55 → ~77 GB total
-#   3. Gemma 4 E4B  (vLLM)   audio + vision     ~16 GB weights
-#      + KV cache pool at --gpu-memory-utilization 0.15 → ~21 GB total
-# E4B is the smallest Gemma 4 variant with native audio understanding
-# (the 31B model doesn't support audio at all per Google's model card).
+# ── v0.5.0: co-host Gemma 4 E4B (audio + vision + chat) ────────────────
+# One image, one Tinfoil container, one shim, two GPU workloads on the
+# H200 (~141 GB VRAM):
+#   1. privacy-filter   (text PII + image PII)                 ~16 GB
+#   2. Gemma 4 E4B vLLM (chat + vision + audio, BF16)          ~21 GB
+#      (16 GB weights + ~5 GB KV at --gpu-memory-utilization 0.25)
+# The 31B model stays on Tinfoil's hosted inference.tinfoil.sh path,
+# reached via packages/ai-gateway in the Cloudflare worker — it's a
+# different model with different trade-offs, not a replacement for E4B.
+# E4B is the only Gemma 4 variant with native audio understanding.
 #
-# All three start inside this single container via `entrypoint.sh`;
-# FastAPI proxies /v1/* to the right vLLM by inspecting the request
-# body's `model` field (gemma4-31b → 8001, gemma4-e4b → 8002).
+# vLLM runs as a sibling process inside the same container started by
+# `entrypoint.sh`; FastAPI proxies /v1/* to it on localhost:8001.
 
 cvm-version: 0.7.5
 
-# CPU stays at 16 (vLLM #2 doesn't need more — its scheduler is light).
-# Memory bumped from 96 GB to 128 GB so the now-larger image (+16 GB for
-# E4B weights baked in — Tinfoil hasn't wrapped E4B for the /tinfoil/mpk
-# volume yet) fits on the ramdisk-backed deploy path with margin.
+# CPU stays at 16 (vLLM scheduler is light). Memory bumped from 64 to
+# 96 GB because the now-larger image (+16 GB for E4B weights baked in;
+# E4B isn't on Tinfoil's modelwrap system yet) needs more ramdisk room
+# during pull. The redactor itself didn't need this much.
 cpus: 16
-memory: 131072
+memory: 98304
 gpus: 1
-
-# Mounts the read-only attested model volume into the container at
-# /tinfoil/mpk/mpk-<digest>. Same `mpk` value Tinfoil ships for their
-# official confidential-gemma4-31b deployment — model files are
-# identical so the measurement matches, no re-wrap needed.
-models:
-  - name: "gemma4-31b"
-    repo: "google/gemma-4-31B-it@439edf5652646a0d1bd8b46bfdc1d3645761a445"
-    mpk: "718354742d7b263c729ea11fbef3e744d61815c5b05043eea6ba0dd3ee44ea01_62578688000_27fb23ac-db9b-5e25-991a-90fdf2c9b3a7"
 
 containers:
   - name: privacy-filter
@@ -47,33 +37,29 @@ containers:
     # Bump flow: dispatch release.yml → copy digest from "Print digest"
     # step → paste here → commit → push a new `v*` tag to trigger
     # tinfoil-build.yml which attests this exact digest.
-    image: "ghcr.io/screenpipe/privacy-filter:0.4.0@sha256:REPLACE_AFTER_BUILD"
+    image: "ghcr.io/screenpipe/privacy-filter:0.5.0@sha256:REPLACE_AFTER_BUILD"
     runtime: nvidia
     gpus: all
     # ipc:host is required by some CUDA workloads (PyTorch's shared-mem
-    # tensor pool, NCCL collectives) — set it to match Tinfoil's other
-    # GPU containers (e.g. confidential-gemma4-31b) and avoid surprises.
+    # tensor pool, NCCL collectives) — match Tinfoil's other GPU
+    # containers (e.g. their confidential-gemma4-31b) for consistency.
     ipc: host
     env:
       - PORT: "8080"
-      # vLLM listens on these loopback ports; server.py reverse-proxies
-      # /v1/* by inspecting the body's `model` field — gemma4-31b → 8001
-      # (Tinfoil-wrapped weights), gemma4-e4b → 8002 (weights baked in
-      # the image at /opt/gemma-4-E4B-it).
-      - GEMMA_31B_UPSTREAM: "http://127.0.0.1:8001"
-      - GEMMA_E4B_UPSTREAM: "http://127.0.0.1:8002"
-      - GEMMA_31B_MPK_PATH: "/tinfoil/mpk/mpk-718354742d7b263c729ea11fbef3e744d61815c5b05043eea6ba0dd3ee44ea01"
+      # vLLM listens on this loopback port; server.py reverse-proxies
+      # /v1/* to it. Same container = same network namespace = 127.0.0.1.
+      - GEMMA_UPSTREAM: "http://127.0.0.1:8001"
     restart: "always"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
       interval: "15s"
       timeout: "5s"
       retries: 10
-      # 30 min grace: Gemma 4 31B BF16 weight load from the attested
-      # ramdisk takes a few minutes; vLLM warmup compiles CUDA graphs
-      # after that. Privacy-filter healthcheck on /health responds as
-      # soon as the redactor is up — it does NOT block on vLLM.
-      start_period: "1800s"
+      # 10 min grace — E4B BF16 weight load from the image to VRAM is
+      # ~30 s plus a few seconds of CUDA graph compile. The privacy
+      # filter /health endpoint comes up first; it does NOT wait for
+      # vLLM so /filter is responsive even while E4B is still loading.
+      start_period: "600s"
 
 shim:
   upstream-port: 8080
@@ -86,8 +72,8 @@ shim:
     - /v1/chat/completions
     - /v1/responses
   # Any path not listed is rejected with 404 at the shim — no debug or
-  # introspection leaks. Adding the /v1/* surface for Gemma chat
-  # completions; everything else mirrors v0.3.x.
+  # introspection leaks. /v1/* surface is for Gemma E4B chat / audio /
+  # vision; everything else mirrors v0.3.x.
   paths:
     - /health
     - /filter

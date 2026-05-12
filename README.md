@@ -1,13 +1,14 @@
 # privacy-filter
 
-GPU-backed HTTP wrapper around two PII models plus two co-hosted Gemma chat models, in one Tinfoil container:
+GPU-backed HTTP wrapper around two PII models plus a co-hosted Gemma chat model, in one Tinfoil container:
 
 1. [`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter) — 1.5B-param MoE (50M active) token classifier for **text PII**. Endpoint `POST /filter`.
 2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v9`) — RF-DETR-Nano detector for **image PII** in screenshots. Endpoint `POST /image/detect`.
-3. **[v0.4.0+]** [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) — chat + vision via vLLM. Endpoint `POST /v1/chat/completions` with `model: "gemma4-31b"`. Weights come from Tinfoil's attested `/tinfoil/mpk` volume (same `mpk` as `tinfoilsh/confidential-gemma4-31b`).
-4. **[v0.5.0+]** [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) — chat + vision + **audio** via vLLM. Endpoint `POST /v1/chat/completions` with `model: "gemma4-e4b"`. Weights baked into the image (~16 GB BF16) since Tinfoil hasn't wrapped E4B yet. E4B is the only Gemma 4 variant with native audio understanding.
+3. **[v0.5.0+]** [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) — chat + vision + **audio** via vLLM. Endpoint `POST /v1/chat/completions` with `model: "gemma4-e4b"`. Weights baked into the image (~16 GB BF16) since Tinfoil hasn't wrapped E4B yet. E4B is the only Gemma 4 variant with native audio understanding.
 
-All four workloads deploy inside the same [Tinfoil](https://tinfoil.sh) confidential-compute container on one H200 (~141 GB VRAM) so neither pixels, text, nor chat prompts leave an attested runtime. The shim only publishes uvicorn on `:8080`; `/v1/*` requests are reverse-proxied to the right vLLM on `127.0.0.1:8001` (31B) or `127.0.0.1:8002` (E4B) based on the request body's `model` field. One TLS-attested URL, one auth token, four models sharing one allocation.
+> **Note:** the 31B model (`gemma4-31b`) is **not** in this container. It stays on Tinfoil's hosted `inference.tinfoil.sh` endpoint, reached separately by `packages/ai-gateway` in the Cloudflare worker. E4B is a different model — smaller, multimodal-audio, lower-cost — not a drop-in replacement.
+
+All three workloads deploy inside the same [Tinfoil](https://tinfoil.sh) confidential-compute container on one H200 (~141 GB VRAM) so neither pixels, text, nor chat prompts leave an attested runtime. The shim only publishes uvicorn on `:8080`; `/v1/*` requests are reverse-proxied to vLLM on `127.0.0.1:8001`. One TLS-attested URL, one auth token, three workloads sharing one allocation.
 
 ## API
 

@@ -39,7 +39,6 @@ Design choices:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -72,16 +71,12 @@ MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
 BATCH_WINDOW_MS = int(os.environ.get("BATCH_WINDOW_MS", "30"))
 BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", "16"))
 
-# ── Co-hosted Gemma 4 model proxy ───────────────────────────────────────
-# Two vLLM processes run in this same container (started by entrypoint.sh):
-#   gemma4-31b on 127.0.0.1:8001 — chat + vision (no audio)
-#   gemma4-e4b on 127.0.0.1:8002 — audio + vision (smaller model)
-# Picked by the OpenAI-style `model` field in the request body.
-GEMMA_31B_UPSTREAM = os.environ.get("GEMMA_31B_UPSTREAM", "http://127.0.0.1:8001")
-GEMMA_E4B_UPSTREAM = os.environ.get("GEMMA_E4B_UPSTREAM", "http://127.0.0.1:8002")
-# Default for routes that don't carry a model field (e.g. /v1/models) —
-# 31b is the "primary" big model.
-GEMMA_DEFAULT_UPSTREAM = GEMMA_31B_UPSTREAM
+# ── Co-hosted Gemma 4 E4B proxy ─────────────────────────────────────────
+# One vLLM process runs in this same container (started by entrypoint.sh):
+#   gemma4-e4b on 127.0.0.1:8001 — chat + vision + audio.
+# The 31B does NOT run here — it stays on Tinfoil's hosted
+# inference.tinfoil.sh path, reached separately by the gateway.
+GEMMA_UPSTREAM = os.environ.get("GEMMA_UPSTREAM", "http://127.0.0.1:8001")
 # Hop-by-hop headers per RFC 7230 §6.1 — never forward.
 _HOP_BY_HOP_HEADERS = frozenset([
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -196,11 +191,10 @@ _image_session = None
 _text_batch_queue: "asyncio.Queue[Tuple[str, asyncio.Future]] | None" = None
 _text_batch_task: "asyncio.Task | None" = None
 
-# Long-lived httpx clients for the two Gemma upstreams. Created on
-# startup so the connection pool is shared across requests (vLLM
-# keepalive helps under concurrent /v1/chat/completions load).
-_gemma_31b_client: "httpx.AsyncClient | None" = None
-_gemma_e4b_client: "httpx.AsyncClient | None" = None
+# Long-lived httpx client for the Gemma reverse proxy. Created on startup
+# so the connection pool is shared across requests (vLLM keepalive helps
+# under concurrent /v1/chat/completions load).
+_gemma_client: "httpx.AsyncClient | None" = None
 
 
 @app.on_event("startup")
@@ -326,34 +320,31 @@ def _load_image_model() -> None:
 
 @app.on_event("startup")
 async def _open_gemma_proxy() -> None:
-    """Open shared httpx pools that front the two co-hosted vLLM processes.
+    """Open the shared httpx pool that fronts the co-hosted vLLM.
 
-    vLLM may still be warming up at the moment this runs (Gemma 4 31B BF16
-    weight load to VRAM is several minutes; E4B is faster but still ~30 s).
-    We only build the clients here — the first request to /v1/* eats any
-    remaining warmup wait via httpx's retry/connect logic.
+    vLLM may still be warming up at the moment this runs (E4B BF16 load to
+    VRAM takes ~30 s). We only build the client here — the first request to
+    /v1/* eats any remaining warmup wait via httpx's retry/connect logic.
     """
-    global _gemma_31b_client, _gemma_e4b_client
-    # No outer timeout — chat completions can stream for minutes. The
-    # underlying TCP connect/read timeouts still apply via httpx defaults.
-    timeout = httpx.Timeout(None, connect=10.0)
-    # Single CVM, single GPU per model — vLLM serves serially behind its
-    # own scheduler. A modest pool is enough; oversizing wastes file
-    # handles.
-    limits = httpx.Limits(max_connections=64, max_keepalive_connections=16)
-    _gemma_31b_client = httpx.AsyncClient(base_url=GEMMA_31B_UPSTREAM, timeout=timeout, limits=limits)
-    _gemma_e4b_client = httpx.AsyncClient(base_url=GEMMA_E4B_UPSTREAM, timeout=timeout, limits=limits)
-    log.info("gemma proxy upstreams initialized: 31b=%s e4b=%s", GEMMA_31B_UPSTREAM, GEMMA_E4B_UPSTREAM)
+    global _gemma_client
+    _gemma_client = httpx.AsyncClient(
+        base_url=GEMMA_UPSTREAM,
+        # No outer timeout — chat completions can stream for minutes. The
+        # underlying TCP connect/read timeouts still apply via httpx defaults.
+        timeout=httpx.Timeout(None, connect=10.0),
+        # Single CVM, single GPU — vLLM serves serially behind its own
+        # scheduler. A modest pool is enough; oversizing wastes file handles.
+        limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+    )
+    log.info("gemma proxy upstream initialized: %s", GEMMA_UPSTREAM)
 
 
 @app.on_event("shutdown")
 async def _close_gemma_proxy() -> None:
-    global _gemma_31b_client, _gemma_e4b_client
-    for c_name in ("_gemma_31b_client", "_gemma_e4b_client"):
-        c = globals().get(c_name)
-        if c is not None:
-            await c.aclose()
-            globals()[c_name] = None
+    global _gemma_client
+    if _gemma_client is not None:
+        await _gemma_client.aclose()
+        _gemma_client = None
 
 
 @app.on_event("startup")
@@ -667,59 +658,7 @@ def _merge_adjacent(spans: List[PiiSpan], text: str) -> List[PiiSpan]:
     return merged
 
 
-# ── Gemma 4 reverse proxy (routes by `model` field) ─────────────────────
-
-
-def _pick_upstream_client(body: bytes) -> "httpx.AsyncClient":
-    """Route to gemma4-e4b vs gemma4-31b based on the request body's `model`.
-
-    Cheap JSON peek — if the body doesn't parse or has no `model` field,
-    fall back to the 31b client (the primary chat model). Anything matching
-    "e4b" (case-insensitive) goes to the E4B audio/vision model.
-    """
-    if not body:
-        return _gemma_31b_client  # type: ignore[return-value]
-    try:
-        # We don't validate the full schema here — vLLM upstream does that.
-        # Just enough to pick a route. Body can be large (image_url, audio
-        # base64 payloads), so this peek is JSON-decode + dict lookup.
-        parsed = json.loads(body)
-    except (ValueError, TypeError):
-        return _gemma_31b_client  # type: ignore[return-value]
-    model = (parsed.get("model") if isinstance(parsed, dict) else None) or ""
-    if "e4b" in model.lower():
-        return _gemma_e4b_client  # type: ignore[return-value]
-    return _gemma_31b_client  # type: ignore[return-value]
-
-
-async def _aggregated_models_list() -> "StreamingResponse | Response":
-    """Synthesize /v1/models combining both upstreams.
-
-    vLLM's /v1/models on each upstream only advertises ITS model. We
-    expose both to clients via a single response. Doing this in-process
-    is cheap (each upstream call is a sub-millisecond loopback hop).
-    """
-    from fastapi.responses import JSONResponse
-
-    out_data = []
-    seen = set()
-    for client in (_gemma_31b_client, _gemma_e4b_client):
-        if client is None:
-            continue
-        try:
-            r = await client.get("/v1/models", timeout=5.0)
-            if r.status_code != 200:
-                continue
-            for m in r.json().get("data", []):
-                mid = m.get("id")
-                if mid and mid not in seen:
-                    seen.add(mid)
-                    out_data.append(m)
-        except (httpx.RequestError, ValueError):
-            # If one upstream is still warming up, the other might still
-            # answer — return what we have rather than erroring out.
-            continue
-    return JSONResponse({"object": "list", "data": out_data})
+# ── Gemma 4 E4B reverse proxy ───────────────────────────────────────────
 
 
 @app.api_route(
@@ -730,39 +669,30 @@ async def _aggregated_models_list() -> "StreamingResponse | Response":
     include_in_schema=False,
 )
 async def proxy_to_gemma(path: str, request: Request):
-    """Transparently forward /v1/* to one of the two co-hosted vLLM processes.
+    """Transparently forward /v1/* to the co-hosted Gemma E4B vLLM.
 
     The Tinfoil shim only publishes this container, so anything addressed at
-    /v1/chat/completions, /v1/models, /v1/responses, etc. is routed here.
-    We pick the upstream based on the body's `model` field (gemma4-e4b →
-    8002, gemma4-31b → 8001) and forward via httpx streaming so SSE chat
-    completions stay incremental — buffering them whole would break
-    interactive clients and balloon memory on long responses.
-
-    /v1/models is special: we aggregate both upstreams so clients see both
-    models behind a single endpoint.
+    /v1/chat/completions, /v1/models, /v1/responses, etc. is routed here
+    and forwarded to vLLM at ``GEMMA_UPSTREAM`` (default ``http://127.0.0.1:8001``)
+    using httpx streaming so SSE chat completions stay incremental —
+    buffering them whole would break interactive clients and balloon memory
+    on long responses.
 
     Hop-by-hop headers (RFC 7230 §6.1) are stripped both directions.
     Authentication is handled at the Tinfoil shim edge; we don't re-check.
     """
-    if _gemma_31b_client is None or _gemma_e4b_client is None:
+    if _gemma_client is None:
         raise HTTPException(
             status_code=503,
             detail="gemma upstream proxy not initialized — startup hook didn't run",
         )
 
-    # GET /v1/models is the only place we don't pass through verbatim.
-    if request.method == "GET" and path == "models":
-        return await _aggregated_models_list()
-
-    body = await request.body()
-    upstream_client = _pick_upstream_client(body)
-
     fwd_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in _HOP_BY_HOP_HEADERS
     }
-    upstream_req = upstream_client.build_request(
+    body = await request.body()
+    upstream_req = _gemma_client.build_request(
         method=request.method,
         url=f"/v1/{path}",
         headers=fwd_headers,
@@ -770,7 +700,7 @@ async def proxy_to_gemma(path: str, request: Request):
         params=request.query_params,
     )
     try:
-        upstream = await upstream_client.send(upstream_req, stream=True)
+        upstream = await _gemma_client.send(upstream_req, stream=True)
     except httpx.RequestError as e:
         # vLLM is co-tenant — if it's down we surface 502 rather than a 500.
         log.warning("gemma upstream request error for /v1/%s: %s", path, e)
