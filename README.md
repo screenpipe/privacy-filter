@@ -127,3 +127,9 @@ The CPU-only build (preserved on git history before v0.2.0) was the original dep
 - **Image:** the rfdetr_v8 model was trained on screenpipe-pii-bench-image, which covers Slack / Outlook / Cursor / Terminal / Confluence / GitHub / 1Password / calendars / browsers. Apps with very different UI chrome (e.g. Zoom name overlays on video tiles) are not yet learned — failures should be added back into the bench's synthetic templates rather than fine-tuned on real captures.
 - **Image:** payload cap `MAX_IMAGE_BYTES=20 MB` (override via env). Decoded RGB working buffer is ~3× the payload.
 - Not a compliance certification. One layer in a privacy-by-design stack.
+
+## License
+
+[PolyForm Noncommercial License 1.0.0](./LICENSE.md). You can read, run, fork, modify, and share — **noncommercial use only**. Commercial use requires a separate license; reach out to `louis@screenpi.pe`.
+
+Bundled / downloaded model weights keep their own licenses: `openai/privacy-filter` (OpenAI's terms), `screenpipe/pii-image-redactor` (`rfdetr_v9`), `google/gemma-4-E4B-it` (Gemma Terms of Use). Using this image commercially means complying with all of them in addition to this repo's license.
