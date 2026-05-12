@@ -23,12 +23,14 @@
 
 cvm-version: 0.7.5
 
-# CPU stays at 16 (vLLM scheduler is light). Memory bumped from 64 to
-# 96 GB because the now-larger image (+16 GB for E4B weights baked in;
+# CPU stays at 16 (vLLM scheduler is light). Memory at 131072 (128 GB)
+# because the now-larger image (+16 GB for E4B weights baked in;
 # E4B isn't on Tinfoil's modelwrap system yet) needs more ramdisk room
-# during pull. The redactor itself didn't need this much.
+# during pull. Tinfoil only accepts a fixed set of tiers — 2048, 4096,
+# 8192, 16384, 32768, 65536, 131072, 262144, … — so 96 GB (98304) is
+# rejected as "not a valid tier". 128 GB is the next valid step up.
 cpus: 16
-memory: 98304
+memory: 131072
 gpus: 1
 
 containers:
