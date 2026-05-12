@@ -1,12 +1,13 @@
 # privacy-filter
 
-GPU-backed HTTP wrapper around two PII models plus a co-hosted chat model, in one Tinfoil CVM:
+GPU-backed HTTP wrapper around two PII models plus two co-hosted Gemma chat models, in one Tinfoil container:
 
 1. [`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter) — 1.5B-param MoE (50M active) token classifier for **text PII**. Endpoint `POST /filter`.
 2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v9`) — RF-DETR-Nano detector for **image PII** in screenshots. Endpoint `POST /image/detect`.
-3. **[v0.4.0+]** [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) — confidential chat / vision model served by vLLM. Endpoints `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models`. Reuses Tinfoil's attested model volume (same `mpk` as `tinfoilsh/confidential-gemma4-31b`).
+3. **[v0.4.0+]** [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) — chat + vision via vLLM. Endpoint `POST /v1/chat/completions` with `model: "gemma4-31b"`. Weights come from Tinfoil's attested `/tinfoil/mpk` volume (same `mpk` as `tinfoilsh/confidential-gemma4-31b`).
+4. **[v0.5.0+]** [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) — chat + vision + **audio** via vLLM. Endpoint `POST /v1/chat/completions` with `model: "gemma4-e4b"`. Weights baked into the image (~16 GB BF16) since Tinfoil hasn't wrapped E4B yet. E4B is the only Gemma 4 variant with native audio understanding.
 
-All three deploy inside the same [Tinfoil](https://tinfoil.sh) confidential-compute CVM (1 × H200, ~141 GB VRAM) so neither pixels, text, nor chat prompts leave an attested runtime. The shim only publishes the privacy-filter container; `/v1/*` requests are reverse-proxied via `server.py` to the co-hosted Gemma container on `127.0.0.1:8001`. One TLS-attested URL, one auth token, two GPU workloads sharing one allocation.
+All four workloads deploy inside the same [Tinfoil](https://tinfoil.sh) confidential-compute container on one H200 (~141 GB VRAM) so neither pixels, text, nor chat prompts leave an attested runtime. The shim only publishes uvicorn on `:8080`; `/v1/*` requests are reverse-proxied to the right vLLM on `127.0.0.1:8001` (31B) or `127.0.0.1:8002` (E4B) based on the request body's `model` field. One TLS-attested URL, one auth token, four models sharing one allocation.
 
 ## API
 

@@ -73,6 +73,28 @@ ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
     ${IMAGE_MODEL_PATH}
 RUN chown appuser:appuser ${IMAGE_MODEL_PATH}
 
+# Gemma 4 E4B (BF16) for native audio + image input. ~16 GB on disk.
+# Pinned to the exact revision so attestation measurement is stable
+# across rebuilds. E4B is the smallest Gemma 4 variant with native
+# audio understanding (E2B/E4B only — the 31B model doesn't have it),
+# and it co-tenants the H200 alongside the 31B model.
+#
+# E4B is NOT on Tinfoil's modelwrap system yet (only the 31B has a
+# baked /tinfoil/mpk volume), so we ship the weights inside the image.
+# The Gemma Terms of Use permit redistribution; downstream consumers
+# still must accept terms via HuggingFace to download the model
+# directly. Image size grows ~16 GB; Tinfoil's ramdisk-backed deploy
+# path can handle it (we already bumped memory to 96 GB in v0.4.0).
+ARG GEMMA_E4B_REPO=google/gemma-4-E4B-it
+ARG GEMMA_E4B_REVISION=3555bddc93a623db8887dd2e52123facc45ade77
+ENV GEMMA_E4B_DIR=/opt/gemma-4-E4B-it
+RUN python3 -c "from huggingface_hub import snapshot_download; \
+                snapshot_download('${GEMMA_E4B_REPO}', \
+                                  revision='${GEMMA_E4B_REVISION}', \
+                                  local_dir='${GEMMA_E4B_DIR}', \
+                                  local_dir_use_symlinks=False)" \
+    && chown -R appuser:appuser ${GEMMA_E4B_DIR}
+
 COPY --chown=appuser:appuser server.py /app/server.py
 COPY --chown=appuser:appuser entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
