@@ -7,39 +7,36 @@
 # the image at the pinned digest, runs remote attestation, and exposes the
 # service at https://<name>.<org>.containers.tinfoil.dev.
 #
-# ── v0.4.0: co-host Gemma 4 31B for cloud audio/video chat ──────────────
-# This CVM now serves TWO workloads on one H200 (~141 GB VRAM):
-#   1. privacy-filter (this image)         — text PII + image PII, ~16 GB
-#   2. confidential-gemma4-31b (tinfoilsh)  — Gemma 4 31B BF16,    ~62 GB
-#      + KV cache pool                                                ~50 GB
-# That fits comfortably with headroom for input buffers. The shim only
-# publishes container 0 (privacy-filter); /v1/* paths reach Gemma via the
-# server.py reverse proxy at 127.0.0.1:8001 (network_mode: host on both).
+# ── v0.4.0: co-host Gemma 4 31B in this same container ─────────────────
+# One image, one Tinfoil container, one shim, two GPU workloads sharing
+# the H200 (~141 GB VRAM):
+#   1. privacy-filter      (text PII + image PII)         ~16 GB
+#   2. Gemma 4 31B (vLLM)  served at /v1/chat/completions  ~62 GB weights
+#      + KV cache pool sized via --gpu-memory-utilization      ~47 GB
+# vLLM runs as a sibling process inside the same container started by
+# `entrypoint.sh`; FastAPI proxies /v1/* to it on localhost:8001.
 
 cvm-version: 0.7.5
 
-# CPU/mem bumped for the second container. vLLM serving needs more cores
-# than the original 8 (Tinfoil's stand-alone Gemma config uses 16); RAM
-# bumped to 96 GB so the new image pull, the vLLM page tables, and the
-# OPF/rfdetr models all fit on Tinfoil's ramdisk-backed deploy path.
+# CPU/mem bumped from 8/64 to 16/96. vLLM serving wants more cores than
+# the original 8; RAM bumped so the (now larger) image pull, vLLM page
+# tables, and the OPF/rfdetr models all fit on Tinfoil's ramdisk-backed
+# deploy path. The 62 GB Gemma weights themselves come from /tinfoil/mpk
+# (the attested model volume), not the image, so the image stays modest.
 cpus: 16
 memory: 98304
 gpus: 1
 
-# Mounts the read-only attested model volume into both containers at
-# /tinfoil/mpk/mpk-<digest>. Same `mpk` Tinfoil ships for their official
-# confidential-gemma4-31b deployment — the model files are identical so
-# the measurement matches; no re-wrap needed.
+# Mounts the read-only attested model volume into the container at
+# /tinfoil/mpk/mpk-<digest>. Same `mpk` value Tinfoil ships for their
+# official confidential-gemma4-31b deployment — model files are
+# identical so the measurement matches, no re-wrap needed.
 models:
   - name: "gemma4-31b"
     repo: "google/gemma-4-31B-it@439edf5652646a0d1bd8b46bfdc1d3645761a445"
     mpk: "718354742d7b263c729ea11fbef3e744d61815c5b05043eea6ba0dd3ee44ea01_62578688000_27fb23ac-db9b-5e25-991a-90fdf2c9b3a7"
 
 containers:
-  # ── Container 0 (shim upstream): privacy-filter + /v1/* proxy ─────────
-  # The Tinfoil shim publishes ONLY the first container's port. server.py
-  # also reverse-proxies /v1/* to the co-hosted Gemma vLLM on 127.0.0.1:8001
-  # so a single TLS-attested URL fronts both workloads.
   - name: privacy-filter
     # Pinned via .github/workflows/release.yml (workflow_dispatch).
     # Bump flow: dispatch release.yml → copy digest from "Print digest"
@@ -52,70 +49,30 @@ containers:
     # tensor pool, NCCL collectives) — set it to match Tinfoil's other
     # GPU containers (e.g. confidential-gemma4-31b) and avoid surprises.
     ipc: host
-    # network_mode: host lets this container reach the Gemma container at
-    # 127.0.0.1:8001. The default docker bridge has no service-name DNS,
-    # and Tinfoil's boot doesn't create a user-defined network, so host
-    # mode is the only inter-container path that doesn't depend on
-    # bridge-IP discovery (which is dynamic and ugly to plumb).
-    network_mode: host
     env:
       - PORT: "8080"
+      # vLLM listens on this loopback port; server.py reverse-proxies
+      # /v1/* to it. Same container = same network namespace = 127.0.0.1.
       - GEMMA_UPSTREAM: "http://127.0.0.1:8001"
+      - GEMMA_MPK_PATH: "/tinfoil/mpk/mpk-718354742d7b263c729ea11fbef3e744d61815c5b05043eea6ba0dd3ee44ea01"
     restart: "always"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
       interval: "15s"
       timeout: "5s"
       retries: 10
-      # 10 min grace: even with weights baked into the image, first
-      # boot pays a CUDA context init + TensorRT engine warm-up cost
-      # for rfdetr_v8 the first time it sees a 384×384 input. Plus the
-      # bf16 text-model weight load to VRAM (~3 GB at H100 PCIe rates).
-      # The Gemma container has its own (longer) healthcheck below — we
-      # don't probe it from here so this container reports ready as soon
-      # as PII filtering works, even while Gemma is still warming up.
-      start_period: "600s"
-
-  # ── Container 1: Gemma 4 31B via vLLM ────────────────────────────────
-  # Tinfoil's pinned image (digest from confidential-gemma4-31b v0.0.12).
-  # Same `--gpu-memory-utilization` knob as their config but dropped from
-  # 0.95 → 0.85 to leave ~21 GB headroom for the privacy-filter models.
-  - name: gemma4
-    image: "ghcr.io/tinfoilsh/confidential-gemma4-31b@sha256:1e1938cc35ae260ab912db80798d95ebd16fdfb0a18b7708ded53e3bcf8fea76"
-    runtime: nvidia
-    gpus: all
-    ipc: host
-    network_mode: host
-    command: [
-      "--model", "/tinfoil/mpk/mpk-718354742d7b263c729ea11fbef3e744d61815c5b05043eea6ba0dd3ee44ea01",
-      "--tensor-parallel-size", "1",
-      "--gpu-memory-utilization", "0.85",
-      "--served-model-name", "gemma4-31b",
-      "--enable-auto-tool-choice",
-      "--tool-call-parser", "gemma4",
-      "--reasoning-parser", "gemma4",
-      "--chat-template", "examples/tool_chat_template_gemma4.jinja",
-      "--scheduling-policy", "priority",
-      "--max-num-seqs", "32",
-      "--port", "8001"
-    ]
-    restart: always
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
-      interval: "30s"
-      timeout: "5s"
-      # 30 min grace — Gemma 4 31B BF16 weight load to VRAM from the
-      # attested ramdisk takes several minutes the first time; vLLM
-      # warmup compiles CUDA graphs after that. Matches the official
-      # Tinfoil confidential-gemma4-31b config exactly.
-      start_period: "30m"
+      # 30 min grace: Gemma 4 31B BF16 weight load from the attested
+      # ramdisk takes a few minutes; vLLM warmup compiles CUDA graphs
+      # after that. Privacy-filter healthcheck on /health responds as
+      # soon as the redactor is up — it does NOT block on vLLM.
+      start_period: "1800s"
 
 shim:
   upstream-port: 8080
   # /v1/chat/completions and /v1/responses go through Tinfoil's
   # control-plane API-key check. /filter, /image/detect, /health stay
   # un-authenticated for the existing screenpipe-redact clients — same
-  # posture as v0.3.x to avoid breaking those clients on this rollout.
+  # posture as v0.3.x to avoid breaking them on this rollout.
   authenticated: true
   authenticated-endpoints:
     - /v1/chat/completions
