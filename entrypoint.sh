@@ -35,6 +35,7 @@ vllm serve "${GEMMA_E4B_DIR}" \
     --served-model-name gemma4-e4b \
     --max-model-len 8192 \
     --max-num-seqs 8 \
+    --limit-mm-per-prompt '{"image": 4, "audio": 1}' \
     --port "${GEMMA_PORT}" \
     >/proc/1/fd/1 2>/proc/1/fd/2 &
 vllm_pid=$!
