@@ -44,7 +44,9 @@ import os
 import time
 from typing import List, Tuple
 
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
@@ -68,6 +70,18 @@ MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
 #                     1.5B-param model on 80 GB H100/H200.
 BATCH_WINDOW_MS = int(os.environ.get("BATCH_WINDOW_MS", "30"))
 BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", "16"))
+
+# ── Co-hosted Gemma 4 31B proxy ─────────────────────────────────────────
+# The Tinfoil CVM publishes only container 0 (this one) through the shim.
+# vLLM serving google/gemma-4-31B-it runs as container 1 inside the same
+# CVM. Both containers use network_mode: host so the proxy can reach
+# vLLM via 127.0.0.1 — the default docker bridge has no service-name DNS.
+GEMMA_UPSTREAM = os.environ.get("GEMMA_UPSTREAM", "http://127.0.0.1:8001")
+# Hop-by-hop headers per RFC 7230 §6.1 — never forward.
+_HOP_BY_HOP_HEADERS = frozenset([
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+])
 
 # ── Image-PII detector (rfdetr_v8) ──────────────────────────────────────
 # Path to the ONNX. Baked in by the Dockerfile from
@@ -176,6 +190,11 @@ _image_session = None
 # is bound to FastAPI's running event loop.
 _text_batch_queue: "asyncio.Queue[Tuple[str, asyncio.Future]] | None" = None
 _text_batch_task: "asyncio.Task | None" = None
+
+# Long-lived httpx client for the Gemma reverse proxy. Created on startup
+# so the connection pool is shared across requests (vLLM keepalive helps
+# under concurrent /v1/chat/completions load).
+_gemma_client: "httpx.AsyncClient | None" = None
 
 
 @app.on_event("startup")
@@ -297,6 +316,36 @@ def _load_image_model() -> None:
         # keep serving than fail boot. The first real request will eat
         # whatever build cost remains.
         log.warning("image model warmup failed (will retry on first request): %s", e)
+
+
+@app.on_event("startup")
+async def _open_gemma_proxy() -> None:
+    """Open the shared httpx pool that fronts the co-hosted vLLM container.
+
+    vLLM may still be warming up at the moment this runs (Gemma 4 31B BF16
+    takes a few minutes to load weights to VRAM). We only build the client
+    here — the first request to /v1/* eats any remaining warmup wait via
+    httpx's retry/connect.
+    """
+    global _gemma_client
+    _gemma_client = httpx.AsyncClient(
+        base_url=GEMMA_UPSTREAM,
+        # No outer timeout — chat completions can stream for minutes. The
+        # underlying TCP connect/read timeouts still apply via httpx defaults.
+        timeout=httpx.Timeout(None, connect=10.0),
+        # Single CVM, single GPU — vLLM serves serially behind its own
+        # scheduler. A modest pool is enough; oversizing wastes file handles.
+        limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+    )
+    log.info("gemma proxy upstream initialized: %s", GEMMA_UPSTREAM)
+
+
+@app.on_event("shutdown")
+async def _close_gemma_proxy() -> None:
+    global _gemma_client
+    if _gemma_client is not None:
+        await _gemma_client.aclose()
+        _gemma_client = None
 
 
 @app.on_event("startup")
@@ -608,6 +657,74 @@ def _merge_adjacent(spans: List[PiiSpan], text: str) -> List[PiiSpan]:
         else:
             merged.append(cur)
     return merged
+
+
+# ── Gemma 4 31B reverse proxy ───────────────────────────────────────────
+
+
+@app.api_route(
+    "/v1/{path:path}",
+    methods=["GET", "POST", "OPTIONS"],
+    # Don't show this in the OpenAPI schema — it's a transparent pass-through
+    # and vLLM advertises its own OpenAPI at /v1/openapi.json upstream.
+    include_in_schema=False,
+)
+async def proxy_to_gemma(path: str, request: Request):
+    """Transparently forward /v1/* to the co-hosted Gemma vLLM container.
+
+    The Tinfoil shim only publishes container 0 (this one) so anything
+    addressed at /v1/chat/completions, /v1/models, /v1/responses, etc.
+    is routed here. We forward to vLLM at ``GEMMA_UPSTREAM`` (default
+    ``http://127.0.0.1:8001``) using httpx streaming so SSE chat completions
+    stay incremental — buffering them whole would break interactive clients
+    and balloon memory on long responses.
+
+    Hop-by-hop headers (RFC 7230 §6.1) are stripped both directions.
+    Authentication is handled at the Tinfoil shim edge; we don't re-check.
+    """
+    if _gemma_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="gemma upstream proxy not initialized — startup hook didn't run",
+        )
+
+    fwd_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in _HOP_BY_HOP_HEADERS
+    }
+    body = await request.body()
+    upstream_req = _gemma_client.build_request(
+        method=request.method,
+        url=f"/v1/{path}",
+        headers=fwd_headers,
+        content=body,
+        params=request.query_params,
+    )
+    try:
+        upstream = await _gemma_client.send(upstream_req, stream=True)
+    except httpx.RequestError as e:
+        # vLLM is co-tenant — if it's down we surface 502 rather than a 500.
+        log.warning("gemma upstream request error for /v1/%s: %s", path, e)
+        raise HTTPException(status_code=502, detail=f"gemma upstream unreachable: {e}")
+
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in _HOP_BY_HOP_HEADERS
+    }
+
+    async def _stream():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(
+        _stream(),
+        status_code=upstream.status_code,
+        headers=resp_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
 
 
 if __name__ == "__main__":

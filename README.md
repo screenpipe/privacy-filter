@@ -1,13 +1,12 @@
 # privacy-filter
 
-CPU-only HTTP wrapper around two PII models, in one Tinfoil container:
+GPU-backed HTTP wrapper around two PII models plus a co-hosted chat model, in one Tinfoil CVM:
 
 1. [`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter) — 1.5B-param MoE (50M active) token classifier for **text PII**. Endpoint `POST /filter`.
-2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v8`) — RF-DETR-Nano detector for **image PII** in screenshots. Endpoint `POST /image/detect`.
+2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v9`) — RF-DETR-Nano detector for **image PII** in screenshots. Endpoint `POST /image/detect`.
+3. **[v0.4.0+]** [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) — confidential chat / vision model served by vLLM. Endpoints `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models`. Reuses Tinfoil's attested model volume (same `mpk` as `tinfoilsh/confidential-gemma4-31b`).
 
-Both deploy inside the same [Tinfoil](https://tinfoil.sh) confidential-compute enclave so neither pixels nor text leave an attested runtime. Intended to sit in front of screenpipe's outbound LLM calls (text path) and behind screenpipe's image-PII reconciliation worker (image path) so user data is masked before it reaches anywhere else.
-
-One container, one image hash, one attestation measurement, one client config (one URL, one auth token).
+All three deploy inside the same [Tinfoil](https://tinfoil.sh) confidential-compute CVM (1 × H200, ~141 GB VRAM) so neither pixels, text, nor chat prompts leave an attested runtime. The shim only publishes the privacy-filter container; `/v1/*` requests are reverse-proxied via `server.py` to the co-hosted Gemma container on `127.0.0.1:8001`. One TLS-attested URL, one auth token, two GPU workloads sharing one allocation.
 
 ## API
 

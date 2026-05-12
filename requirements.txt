@@ -17,3 +17,8 @@ pillow==11.0.0
 # numpy is pulled in transitively by torch but pin it explicitly so a
 # torch minor bump can't drift the version we test against.
 numpy==2.1.3
+# httpx is the async client used by server.py to reverse-proxy /v1/*
+# requests to the co-hosted Gemma vLLM container at 127.0.0.1:8001.
+# Pinned because patches between minor versions have changed how
+# streaming generators close — SSE behavior matters here.
+httpx==0.27.2
