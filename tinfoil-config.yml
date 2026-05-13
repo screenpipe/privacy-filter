@@ -39,7 +39,7 @@ containers:
     # Bump flow: dispatch release.yml → copy digest from "Print digest"
     # step → paste here → commit → push a new `v*` tag to trigger
     # tinfoil-build.yml which attests this exact digest.
-    image: "ghcr.io/screenpipe/privacy-filter:0.5.0@sha256:2fd60d930c698a09c4430ee81f169e0b90988765f55c37b85205ea68e0359d0d"
+    image: "ghcr.io/screenpipe/privacy-filter:0.5.0@sha256:bbb12c453a8cfd5e7dc586381777afd5c035d96f2931990e47cabe643ec4ce75"
     runtime: nvidia
     gpus: all
     # ipc:host is required by some CUDA workloads (PyTorch's shared-mem
