@@ -2,7 +2,7 @@
 
 GPU-backed HTTP wrapper around two PII models plus a co-hosted Gemma chat model, in one Tinfoil container:
 
-1. [`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter) — 1.5B-param MoE (50M active) token classifier for **text PII**. Endpoint `POST /filter`.
+1. [`screenpipe/pii-text-redactor`](https://huggingface.co/screenpipe/pii-text-redactor) revision `v6` — ScreenPipe fine-tuned OPF 1.5B-param MoE (50M active) token classifier for **text PII**. Endpoint `POST /filter`.
 2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v9`) — RF-DETR-Nano detector for **image PII** in screenshots. Endpoint `POST /image/detect`.
 3. **[v0.5.0+]** [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) — chat + vision + **audio** via vLLM. Endpoint `POST /v1/chat/completions` with `model: "gemma4-e4b"`. Weights baked into the image (~16 GB BF16) since Tinfoil hasn't wrapped E4B yet. E4B is the only Gemma 4 variant with native audio understanding.
 
@@ -20,7 +20,7 @@ POST /filter         → {"text": "My email is alice@foo.com"}
                         "spans": [{"label": "private_email", "start": 12, "end": 25,
                                    "text": "alice@foo.com", "score": 0.99}],
                         "latency_ms": 180,
-                        "model": "openai/privacy-filter"}
+                        "model": "screenpipe/pii-text-redactor:v6 (bf16-cuda)"}
 
 POST /image/detect   → {"image_b64": "<b64-jpg-or-png>", "threshold": 0.30}
                     ←  {"detections": [{"bbox": [x, y, w, h], "label": "private_person", "score": 0.95},
@@ -53,7 +53,7 @@ curl -s -X POST http://localhost:8080/image/detect \
      -d "$(jq -nc --arg img "$B64" '{image_b64: $img, threshold: 0.30}')" | jq
 ```
 
-First build pre-downloads the 1.5B text model (~3 GB bf16) AND the 108 MB rfdetr_v8 ONNX into the image, so expect a 5–10 min initial build. Subsequent builds hit Docker's layer cache. The image-model `ADD --checksum=` directive verifies the SHA-256 against the value pinned in the `Dockerfile` so a rebuild can't silently drift to a different upstream weight.
+First build pre-downloads the ScreenPipe fine-tuned OPF text model (~3 GB bf16) AND the 108 MB rfdetr_v8 ONNX into the image, so expect a 5–10 min initial build. Subsequent builds hit Docker's layer cache. The text model is pinned to HuggingFace revision `v6`, and the tokenizer is pinned to the upstream OPF commit in the `Dockerfile`; the image-model `ADD --checksum=` directive verifies the SHA-256 against the value pinned in the `Dockerfile` so a rebuild can't silently drift to a different upstream weight.
 
 ## Deploy to Tinfoil
 
@@ -89,7 +89,7 @@ First build pre-downloads the 1.5B text model (~3 GB bf16) AND the 108 MB rfdetr
 
 ## Resource sizing (GPU)
 
-**Text model (OPF) — BF16 on CUDA:**
+**Text model (ScreenPipe fine-tuned OPF v6) — BF16 on CUDA:**
 
 | Metric | Value |
 |---|---|
@@ -132,4 +132,4 @@ The CPU-only build (preserved on git history before v0.2.0) was the original dep
 
 [PolyForm Noncommercial License 1.0.0](./LICENSE.md). You can read, run, fork, modify, and share — **noncommercial use only**. Commercial use requires a separate license; reach out to `louis@screenpi.pe`.
 
-Bundled / downloaded model weights keep their own licenses: `openai/privacy-filter` (OpenAI's terms), `screenpipe/pii-image-redactor` (`rfdetr_v9`), `google/gemma-4-E4B-it` (Gemma Terms of Use). Using this image commercially means complying with all of them in addition to this repo's license.
+Bundled / downloaded model weights keep their own licenses: `screenpipe/pii-text-redactor` (ScreenPipe fine-tune built on OpenAI Privacy Filter), `openai/privacy-filter` tokenizer/config code (OpenAI's terms), `screenpipe/pii-image-redactor` (`rfdetr_v9`), `google/gemma-4-E4B-it` (Gemma Terms of Use). Using this image commercially means complying with all of them in addition to this repo's license.

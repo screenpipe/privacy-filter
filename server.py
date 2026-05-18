@@ -6,7 +6,7 @@
 Privacy-filter inference service.
 
 Wraps two models in one container:
-  * openai/privacy-filter (text)  → POST /filter
+  * screenpipe/pii-text-redactor:v6 (text)  → POST /filter
       1.5B-param MoE token classifier (50M active per token). Used by
       screenpipe-redact's `tinfoil` text adapter.
   * rfdetr_v8 (image)             → POST /image/detect
@@ -53,7 +53,7 @@ from transformers import AutoModelForTokenClassification, AutoTokenizer, pipelin
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
-MODEL_ID = os.environ.get("MODEL_ID", "openai/privacy-filter (bf16-cuda)")
+MODEL_ID = os.environ.get("MODEL_ID", "screenpipe/pii-text-redactor:v6 (bf16-cuda)")
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
 # Dynamic batching for /filter. The HF token-classification pipeline
