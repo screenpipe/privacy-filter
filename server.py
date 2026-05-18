@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import List, Tuple
 
@@ -118,6 +119,29 @@ LABEL_TAG = {
     "account_number": "ACCOUNT",
     "secret": "SECRET",
 }
+
+# Deterministic credential shapes that OPF can miss, especially short or
+# prefix-heavy API keys. Keep this pass before the model so obvious secrets
+# are removed even if the learned classifier returns no span.
+SECRET_PATTERNS = [
+    re.compile(r"-----BEGIN[A-Z\s]*PRIVATE KEY[A-Z\s]*-----"),
+    re.compile(r"-----BEGIN[A-Z\s]*SECRET[A-Z\s]*-----"),
+    re.compile(r"-----BEGIN[A-Z\s]*ENCRYPTED[A-Z\s]*KEY[A-Z\s]*-----"),
+    re.compile(
+        r"(?i)(?:postgres|postgresql|mysql|mariadb|mongodb|mongodb\+srv|redis|rediss|amqp|amqps)://[^:\s]+:[^@\s]+@\S+"
+    ),
+    re.compile(r"[a-z][a-z0-9+.-]*://[^:\s]+:[^@\s]+@\S+"),
+    re.compile(r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bgh[psouvr]_[A-Za-z0-9]{30,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{30,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bya29\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+]
 
 
 logging.basicConfig(
@@ -480,6 +504,7 @@ async def filter_pii(req: FilterRequest) -> FilterResponse:
         )
 
     t0 = time.time()
+    filtered_text, deterministic_spans, offset_map = _prefilter_secrets(text)
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     # Hand off to the dynamic batcher and await our slot in the next
@@ -487,31 +512,37 @@ async def filter_pii(req: FilterRequest) -> FilterResponse:
     # thread so this await doesn't pin the event loop. char → token
     # ratio is roughly 4:1 so 100K chars ≈ 25K tokens, well under the
     # tokenizer's 128K cap.
-    await _text_batch_queue.put((text, fut))
+    await _text_batch_queue.put((filtered_text, fut))
     try:
         raw_spans = await fut
     except Exception as e:
         log.exception("inference failed")
         raise HTTPException(status_code=500, detail=f"inference error: {e}")
 
-    spans = _merge_adjacent(
+    model_spans = _merge_adjacent(
         [
             PiiSpan(
                 label=s["entity_group"],
                 start=int(s["start"]),
                 end=int(s["end"]),
-                text=text[int(s["start"]) : int(s["end"])],
+                text=filtered_text[int(s["start"]) : int(s["end"])],
                 score=float(s["score"]),
             )
             for s in raw_spans
         ],
-        text,
+        filtered_text,
     )
 
-    redacted = _redact(text, spans)
+    redacted = _redact(filtered_text, model_spans)
+    response_spans = deterministic_spans + _map_spans_to_original(
+        model_spans,
+        text,
+        offset_map,
+        deterministic_spans,
+    )
     return FilterResponse(
         redacted=redacted,
-        spans=spans if req.include_spans else [],
+        spans=response_spans if req.include_spans else [],
         latency_ms=int((time.time() - t0) * 1000),
         model=MODEL_ID,
     )
@@ -623,6 +654,67 @@ def _redact(text: str, spans: List[PiiSpan]) -> str:
         tag = LABEL_TAG.get(span.label.lower(), span.label.upper())
         out = out[: span.start] + f"[{tag}]" + out[span.end :]
     return out
+
+
+def _prefilter_secrets(text: str) -> tuple[str, List[PiiSpan], List[int]]:
+    spans: List[PiiSpan] = []
+    for pattern in SECRET_PATTERNS:
+        for match in pattern.finditer(text):
+            if any(s.start < match.end() and s.end > match.start() for s in spans):
+                continue
+            spans.append(
+                PiiSpan(
+                    label="secret",
+                    start=match.start(),
+                    end=match.end(),
+                    text=match.group(0),
+                    score=1.0,
+                )
+            )
+    spans.sort(key=lambda s: (s.start, s.end))
+    if not spans:
+        return text, [], list(range(len(text)))
+
+    out_parts: List[str] = []
+    offset_map: List[int] = []
+    cursor = 0
+    for span in spans:
+        out_parts.append(text[cursor : span.start])
+        offset_map.extend(range(cursor, span.start))
+
+        replacement = f"[{LABEL_TAG['secret']}]"
+        out_parts.append(replacement)
+        offset_map.extend([span.start] * len(replacement))
+        cursor = span.end
+    out_parts.append(text[cursor:])
+    offset_map.extend(range(cursor, len(text)))
+    return "".join(out_parts), spans, offset_map
+
+
+def _map_spans_to_original(
+    spans: List[PiiSpan],
+    original_text: str,
+    offset_map: List[int],
+    existing_spans: List[PiiSpan],
+) -> List[PiiSpan]:
+    mapped: List[PiiSpan] = []
+    for span in spans:
+        if span.start < 0 or span.end <= span.start or span.end > len(offset_map):
+            continue
+        start = offset_map[span.start]
+        end = offset_map[span.end - 1] + 1
+        if any(s.start < end and s.end > start for s in existing_spans):
+            continue
+        mapped.append(
+            PiiSpan(
+                label=span.label,
+                start=start,
+                end=end,
+                text=original_text[start:end],
+                score=span.score,
+            )
+        )
+    return mapped
 
 
 def _merge_adjacent(spans: List[PiiSpan], text: str) -> List[PiiSpan]:
