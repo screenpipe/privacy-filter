@@ -28,13 +28,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive
 
 # Tinfoil's base inherits vllm/vllm-openai:v0.20.1 which ships Python
-# 3.12 + torch 2.5.x + a patched vllm. We install our deps with
-# `--no-deps` for torch-adjacent packages so we don't accidentally pull
-# a different torch wheel on top.
+# 3.12 + torch 2.5.x + a patched vllm. We install the official OPF
+# runtime from a pinned source archive so fine-tuned `opf train`
+# checkpoints keep their native checkpoint contract.
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 # Two-phase install:
-#   1) FastAPI / pydantic / httpx — pure-Python, safe to let pip resolve.
+#   1) FastAPI / pydantic / httpx / OPF — safe to let pip resolve.
 #   2) transformers / tokenizers / accelerate / safetensors /
 #      onnxruntime-gpu / pillow / numpy — torch-adjacent, install with
 #      --no-deps so torch stays at the version the base image ships.
@@ -43,6 +43,7 @@ RUN pip install --no-cache-dir \
         "uvicorn[standard]==0.32.0" \
         pydantic==2.9.2 \
         httpx==0.27.2 \
+        "opf @ https://github.com/openai/privacy-filter/archive/f7f00ca7fb869683eb732c010299d901457f19c3.tar.gz" \
  && pip install --no-cache-dir --no-deps \
         transformers==5.6.0 \
         tokenizers==0.22.1 \

@@ -18,8 +18,7 @@ also dodges the dequant codepath that the old server.py had to carry.
 import json
 import os
 
-import torch
-from transformers import AutoModelForTokenClassification, AutoTokenizer
+from huggingface_hub import snapshot_download
 
 
 def main() -> None:
@@ -30,22 +29,20 @@ def main() -> None:
     out = os.environ["MODEL_DIR"]
     os.makedirs(out, exist_ok=True)
 
-    print(f"[build] downloading tokenizer from {tokenizer_src}@{tokenizer_revision or 'default'}")
-    AutoTokenizer.from_pretrained(
-        tokenizer_src,
-        revision=tokenizer_revision,
-        trust_remote_code=True,
-    ).save_pretrained(out)
-
-    print(f"[build] downloading bf16 weights from {src}@{revision or 'default'}")
-    model = AutoModelForTokenClassification.from_pretrained(
+    print(f"[build] downloading OPF checkpoint from {src}@{revision or 'default'}")
+    snapshot_download(
         src,
         revision=revision,
-        trust_remote_code=True,
-        dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
+        local_dir=out,
+        local_dir_use_symlinks=False,
+        allow_patterns=[
+            "config.json",
+            "*.safetensors",
+            "viterbi_calibration.json",
+            "finetune_summary.json",
+            "USAGE.txt",
+        ],
     )
-    model.save_pretrained(out)
     with open(os.path.join(out, "screenpipe_model_source.json"), "w") as f:
         json.dump(
             {

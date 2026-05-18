@@ -48,19 +48,17 @@ from typing import List, Tuple
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from opf import OPF
 from pydantic import BaseModel, Field
-from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
 MODEL_ID = os.environ.get("MODEL_ID", "screenpipe/pii-text-redactor:v6 (bf16-cuda)")
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
-# Dynamic batching for /filter. The HF token-classification pipeline
-# pads + runs one CUDA forward pass per batch, so grouping concurrent
-# requests is ~free up to a memory ceiling. Live v0.3.1 bench showed a
-# single-stream ceiling of ~2.5 rps with p50 ~400 ms; batching is what
-# unlocks GPU utilization above that.
+# Request coalescing for /filter. OPF inference is single-example today,
+# but a short queue still gives us one serialized CUDA path and natural
+# backpressure under bursts.
 #   BATCH_WINDOW_MS — how long to wait for more requests after the first
 #                     one lands. 30 ms taxes single-request p50 by ~30 ms
 #                     in the no-load case (≈8 % of total) and is well
@@ -206,7 +204,7 @@ app = FastAPI(
 )
 
 # Model handle is a module-level global so FastAPI workers share it.
-_pipeline = None
+_opf: OPF | None = None
 # rfdetr_v8 ONNX session — loaded alongside the text model at startup.
 _image_session = None
 
@@ -229,7 +227,7 @@ def _load_model() -> None:
     30s+ for a cold start, and (b) race with health-check probes during
     deployment rollouts.
     """
-    global _pipeline
+    global _opf
     log.info("loading bf16 model from %s onto CUDA", MODEL_DIR)
     t0 = time.time()
     import torch
@@ -243,26 +241,18 @@ def _load_model() -> None:
             "CUDA-capable host. Check tinfoil-config.yml has gpus:1 + "
             "runtime:nvidia + gpus:all on the container."
         )
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    model = AutoModelForTokenClassification.from_pretrained(
-        MODEL_DIR,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda",
+    _opf = OPF(
+        model=MODEL_DIR,
+        device="cuda",
+        output_mode="typed",
+        output_text_only=False,
     )
-    model.eval()
-    _pipeline = pipeline(
-        task="token-classification",
-        model=model,
-        tokenizer=tok,
-        aggregation_strategy="simple",
-        device=0,  # CUDA:0
-    )
+    runtime = _opf.get_runtime()
     log.info(
         "text model loaded in %.1fs (device=%s, dtype=%s)",
         time.time() - t0,
-        next(model.parameters()).device,
-        next(model.parameters()).dtype,
+        next(runtime.model.parameters()).device,
+        next(runtime.model.parameters()).dtype,
     )
 
 
@@ -376,7 +366,7 @@ async def _start_text_batcher() -> None:
     """Spin up the dynamic-batching worker for /filter.
 
     Must run AFTER `_load_model` because the worker calls into the
-    global `_pipeline`. FastAPI runs startup hooks in registration
+    global `_opf`. FastAPI runs startup hooks in registration
     order, so this is fine as long as we keep it below `_load_model`.
     """
     global _text_batch_queue, _text_batch_task
@@ -391,13 +381,8 @@ async def _start_text_batcher() -> None:
 
 async def _text_batch_worker() -> None:
     """Pull /filter requests off the queue, fuse up to BATCH_MAX_SIZE
-    into one HF-pipeline forward pass, then scatter raw spans back to
-    each awaiter's future.
-
-    The HF token-classification pipeline accepts a list of texts and
-    returns a list of span-lists, padding to the longest text in the
-    batch and running a single CUDA forward pass. That's the bit that
-    breaks the single-stream rps ceiling.
+    into one serialized OPF inference path, then scatter raw spans back
+    to each awaiter's future.
 
     Why a worker instead of `BackgroundTasks`: BackgroundTasks fire
     after the response — we need the response to wait on the result.
@@ -427,13 +412,11 @@ async def _text_batch_worker() -> None:
         futs = [f for _, f in batch]
         t0 = time.time()
         try:
-            # Run the pipeline in the default thread executor — GPU
+            # Run OPF in the default thread executor — GPU
             # inference blocks for hundreds of ms and would otherwise
             # block the asyncio loop (no more requests get queued
             # while the GPU is busy, defeating the point of batching).
-            results = await loop.run_in_executor(
-                None, _pipeline_on_batch, texts
-            )
+            results = await loop.run_in_executor(None, _opf_on_batch, texts)
             elapsed_ms = (time.time() - t0) * 1000
             if len(batch) > 1:
                 log.info(
@@ -452,37 +435,31 @@ async def _text_batch_worker() -> None:
                     fut.set_exception(e)
 
 
-def _pipeline_on_batch(texts: List[str]) -> List[List[dict]]:
-    """Thread-pool wrapper around the HF pipeline that always returns a
-    list-of-lists, even for a 1-element batch.
-
-    Critical: pass `batch_size=len(texts)` so the pipeline actually
-    pads + runs ONE forward pass for the whole list. Without it, HF's
-    token-classification pipeline iterates the list and runs N sequential
-    forward passes — the queue-level batching collects requests but the
-    GPU still sees them one at a time, so throughput stays at the
-    single-stream ceiling. v0.3.2 shipped without this kwarg and a
-    concurrent-probe confirmed: 4 parallel requests landed within
-    270 ms of each other (collected by the batcher) but server_ms was
-    ~1500 ms per request (4× the single-request cost), i.e. 4 sequential
-    forward passes inside one Python call. Setting batch_size fixes it.
-
-    The pipeline returns one flat list of spans when given a single
-    string and a list-of-lists when given a list — we normalize so the
-    worker's zip(futs, results) always lines up.
-    """
-    raw = _pipeline(texts, batch_size=len(texts))
-    # 1-element batch: pipeline may unwrap to a flat list of dicts.
-    if len(texts) == 1 and raw and isinstance(raw[0], dict):
-        return [raw]
-    return raw
+def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
+    """Thread-pool wrapper around OPF that preserves the old span shape."""
+    assert _opf is not None
+    out: List[List[dict]] = []
+    for text in texts:
+        result = _opf.redact(text)
+        out.append(
+            [
+                {
+                    "entity_group": span.label,
+                    "start": span.start,
+                    "end": span.end,
+                    "score": 1.0,
+                }
+                for span in result.detected_spans
+            ]
+        )
+    return out
 
 
 @app.get("/health")
 def health() -> dict:
     return {
         "status": "ok",
-        "model_ready": _pipeline is not None,
+        "model_ready": _opf is not None,
         "model": MODEL_ID,
         "image_model_ready": _image_session is not None,
         "image_model": IMAGE_MODEL_ID,
@@ -491,7 +468,7 @@ def health() -> dict:
 
 @app.post("/filter", response_model=FilterResponse)
 async def filter_pii(req: FilterRequest) -> FilterResponse:
-    if _pipeline is None or _text_batch_queue is None:
+    if _opf is None or _text_batch_queue is None:
         # Should never happen if startup ran to completion, but guard anyway —
         # Tinfoil may route traffic before our startup hook finishes on first boot.
         raise HTTPException(status_code=503, detail="model not loaded yet")
@@ -508,7 +485,7 @@ async def filter_pii(req: FilterRequest) -> FilterResponse:
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     # Hand off to the dynamic batcher and await our slot in the next
-    # batch. The worker runs the actual HF pipeline on a background
+    # batch. The worker runs the actual OPF inference on a background
     # thread so this await doesn't pin the event loop. char → token
     # ratio is roughly 4:1 so 100K chars ≈ 25K tokens, well under the
     # tokenizer's 128K cap.
@@ -720,7 +697,7 @@ def _map_spans_to_original(
 def _merge_adjacent(spans: List[PiiSpan], text: str) -> List[PiiSpan]:
     """Merge touching / near-touching spans of the same label.
 
-    The HF token-classification pipeline emits one span per sub-word group,
+    The token classifier can emit one span per sub-word group,
     so a single name or phone number often comes back as 2-4 adjacent spans
     of the same label. Without merging, the redactor emits `[PERSON][PERSON]`
     for every such run. We collapse any pair where the gap between them is

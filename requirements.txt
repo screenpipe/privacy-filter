@@ -4,8 +4,10 @@ pydantic==2.9.2
 # CUDA-enabled torch wheels from PyPI — bundled with CUDA 12.4 runtime,
 # matching the nvidia/cuda:12.4.1-cudnn-runtime base image.
 torch==2.5.1
-# openai/privacy-filter ships a custom `OpenAIPrivacyFilterForTokenClassification`
-# arch + `TokenizersBackend` tokenizer class; both require transformers >= 5.x.
+# Official OPF runtime for checkpoints produced by `opf train`.
+opf @ https://github.com/openai/privacy-filter/archive/f7f00ca7fb869683eb732c010299d901457f19c3.tar.gz
+# Kept for compatibility with the Tinfoil vLLM base and historical local
+# workflows; the text redactor itself uses OPF directly.
 transformers==5.6.0
 tokenizers==0.22.1
 accelerate==1.1.1
