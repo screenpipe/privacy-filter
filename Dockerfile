@@ -25,6 +25,8 @@ FROM ${TINFOIL_VLLM_BASE}
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=5 \
     DEBIAN_FRONTEND=noninteractive
 
 # Tinfoil's base inherits vllm/vllm-openai:v0.20.1 which ships Python
