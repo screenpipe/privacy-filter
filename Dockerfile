@@ -52,14 +52,23 @@ RUN pip install --no-cache-dir \
         pillow==11.0.0 \
         numpy==2.1.3
 
-# Download the OPF text model at BF16 — ~3 GB on disk. Goes into the
-# image so first boot is fast and reproducible (build-time download,
-# verified at attestation time).
-ARG SOURCE_MODEL_ID=openai/privacy-filter
-ENV MODEL_DIR=/opt/model
+# Download the ScreenPipe fine-tuned OPF text model at BF16 — ~3 GB on
+# disk. Goes into the image so first boot is fast and reproducible
+# (build-time download, verified at attestation time). The fine-tune repo
+# carries the checkpoint; the tokenizer still comes from upstream OPF.
+ARG SOURCE_MODEL_ID=screenpipe/pii-text-redactor
+ARG SOURCE_MODEL_REVISION=v6
+ARG TOKENIZER_MODEL_ID=openai/privacy-filter
+ARG TOKENIZER_MODEL_REVISION=7ffa9a043d54d1be65afb281eddf0ffbe629385b
+ENV MODEL_DIR=/opt/model \
+    MODEL_ID="screenpipe/pii-text-redactor:v6 (bf16-cuda)"
 COPY build_download.py /tmp/build_download.py
 RUN useradd --system --no-create-home --uid 10001 appuser \
-    && SOURCE_MODEL_ID=$SOURCE_MODEL_ID MODEL_DIR=$MODEL_DIR \
+    && SOURCE_MODEL_ID=$SOURCE_MODEL_ID \
+       SOURCE_MODEL_REVISION=$SOURCE_MODEL_REVISION \
+       TOKENIZER_MODEL_ID=$TOKENIZER_MODEL_ID \
+       TOKENIZER_MODEL_REVISION=$TOKENIZER_MODEL_REVISION \
+       MODEL_DIR=$MODEL_DIR \
        python3 /tmp/build_download.py \
     && rm -rf /root/.cache/huggingface /tmp/build_download.py \
     && chown -R appuser:appuser $MODEL_DIR
