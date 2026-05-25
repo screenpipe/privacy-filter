@@ -36,8 +36,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 # Two-phase install:
-#   1) FastAPI / pydantic / httpx / OPF — safe to let pip resolve.
-#   2) transformers / tokenizers / accelerate / safetensors /
+#   1) FastAPI / pydantic / httpx / huggingface_hub — safe to let pip
+#      resolve.
+#   2) transformers / tokenizers / accelerate / safetensors / optimum /
 #      onnxruntime-gpu / pillow / numpy — torch-adjacent, install with
 #      --no-deps so torch stays at the version the base image ships.
 RUN pip install --no-cache-dir \
@@ -45,32 +46,35 @@ RUN pip install --no-cache-dir \
         "uvicorn[standard]==0.32.0" \
         pydantic==2.9.2 \
         httpx==0.27.2 \
-        "opf @ https://github.com/openai/privacy-filter/archive/f7f00ca7fb869683eb732c010299d901457f19c3.tar.gz" \
+        huggingface_hub==0.26.2 \
  && pip install --no-cache-dir --no-deps \
         transformers==5.6.0 \
         tokenizers==0.22.1 \
         accelerate==1.1.1 \
         safetensors==0.4.5 \
         onnxruntime-gpu==1.20.1 \
+        optimum==1.23.3 \
         pillow==11.0.0 \
         numpy==2.1.3
 
-# Download the ScreenPipe fine-tuned OPF text model at BF16 — ~3 GB on
-# disk. Goes into the image so first boot is fast and reproducible
-# (build-time download, verified at attestation time). The fine-tune repo
-# carries the checkpoint; the tokenizer still comes from upstream OPF.
-ARG SOURCE_MODEL_ID=screenpipe/pii-text-redactor
-ARG SOURCE_MODEL_REVISION=v6
-ARG TOKENIZER_MODEL_ID=openai/privacy-filter
-ARG TOKENIZER_MODEL_REVISION=7ffa9a043d54d1be65afb281eddf0ffbe629385b
+# Download the ScreenPipe v45_phase3 text PII redactor — INT8 ONNX,
+# ~278 MB on disk (model_quantized.onnx + tokenizer.json + config.json).
+# Same checkpoint the desktop app downloads on first run, so the
+# container's /filter output matches what local clients produce.
+#
+# Build-time download with per-file SHA-256 verification (in
+# build_download.py); the resulting image hash is reproducible across
+# rebuilds and covered by Tinfoil's remote attestation measurement.
+ARG SOURCE_MODEL_ID=screenpipe/pii-redactor
+ARG SOURCE_MODEL_REVISION=main
+ARG SOURCE_MODEL_SUBFOLDER=v45_phase3_onnx
 ENV MODEL_DIR=/opt/model \
-    MODEL_ID="screenpipe/pii-text-redactor:v6 (bf16-cuda)"
+    MODEL_ID="screenpipe/pii-redactor:v45_phase3 (int8-onnx)"
 COPY build_download.py /tmp/build_download.py
 RUN useradd --system --no-create-home --uid 10001 appuser \
     && SOURCE_MODEL_ID=$SOURCE_MODEL_ID \
        SOURCE_MODEL_REVISION=$SOURCE_MODEL_REVISION \
-       TOKENIZER_MODEL_ID=$TOKENIZER_MODEL_ID \
-       TOKENIZER_MODEL_REVISION=$TOKENIZER_MODEL_REVISION \
+       SOURCE_MODEL_SUBFOLDER=$SOURCE_MODEL_SUBFOLDER \
        MODEL_DIR=$MODEL_DIR \
        python3 /tmp/build_download.py \
     && rm -rf /root/.cache/huggingface /tmp/build_download.py \
