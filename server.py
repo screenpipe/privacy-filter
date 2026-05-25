@@ -6,11 +6,12 @@
 Privacy-filter inference service.
 
 Wraps two models in one container:
-  * screenpipe/pii-text-redactor:v6 (text)  → POST /filter
-      1.5B-param MoE token classifier (50M active per token). Used by
-      screenpipe-redact's `tinfoil` text adapter.
-  * rfdetr_v8 (image)             → POST /image/detect
-      RF-DETR-Nano detector (~25M params at 320×320), fine-tuned on
+  * screenpipe/pii-redactor:v45_phase3 (text)  → POST /filter
+      xlm-roberta-base fine-tune, INT8 ONNX (~278 MB on disk). Same
+      checkpoint the desktop app downloads on first run — outputs
+      match across local + container surfaces.
+  * rfdetr_v9 (image)                          → POST /image/detect
+      RF-DETR-Nano detector (~28 M params at 384×384), fine-tuned on
       screenpipe-pii-bench-image. Used by screenpipe-redact's
       `tinfoil_image` adapter. Same 12-class taxonomy as the bench.
 
@@ -27,9 +28,10 @@ Endpoints:
 
 Design choices:
     - Both models loaded once at process start.
-    - GPU inference (H100 / H200): text model runs at BF16 (~3 GB VRAM);
-      image model runs through ONNX Runtime's TensorRT EP (CUDA fallback,
-      then CPU as a last-resort safety net).
+    - GPU inference (H100 / H200): text model runs through ONNX Runtime's
+      CUDAExecutionProvider (INT8 quantized, sub-ms per token); image
+      model runs through ORT's TensorRT EP (CUDA fallback, CPU as a
+      final safety net).
     - Replaced PII is tagged as [LABEL] (text) or returned as bbox+
       label (image). The downstream client decides how to render.
     - Memory ceiling enforced via MAX_INPUT_TOKENS / MAX_IMAGE_BYTES
@@ -48,25 +50,24 @@ from typing import List, Tuple
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from opf import OPF
 from pydantic import BaseModel, Field
+from transformers import AutoTokenizer, pipeline
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
-MODEL_ID = os.environ.get("MODEL_ID", "screenpipe/pii-text-redactor:v6 (bf16-cuda)")
+MODEL_ID = os.environ.get("MODEL_ID", "screenpipe/pii-redactor:v45_phase3 (int8-onnx)")
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
-# Request coalescing for /filter. OPF inference is single-example today,
-# but a short queue still gives us one serialized CUDA path and natural
-# backpressure under bursts.
+# Request coalescing for /filter. The HF `ner` pipeline accepts a list
+# input and pads + runs one CUDA forward pass per batch, so grouping
+# concurrent requests is ~free up to a memory ceiling.
 #   BATCH_WINDOW_MS — how long to wait for more requests after the first
 #                     one lands. 30 ms taxes single-request p50 by ~30 ms
 #                     in the no-load case (≈8 % of total) and is well
 #                     under typical client perception threshold.
-#   BATCH_MAX_SIZE  — max requests fused into one forward pass. Larger
-#                     ≈ better throughput but more head-of-line latency
-#                     for the first item; 16 is a safe ceiling for the
-#                     1.5B-param model on 80 GB H100/H200.
+#   BATCH_MAX_SIZE  — max requests fused into one forward pass. v45_phase3
+#                     is xlm-roberta-base; 16 is a safe ceiling on a
+#                     single H100/H200 even with long inputs.
 BATCH_WINDOW_MS = int(os.environ.get("BATCH_WINDOW_MS", "30"))
 BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", "16"))
 
@@ -104,18 +105,25 @@ IMAGE_CLASSES = [
     "private_id",       "private_date",    "secret",
 ]
 
-# Map model labels (lower-cased, underscore-delimited) to the short tag we
-# substitute into the redacted output. Order doesn't matter; unknown labels
-# fall through to the capitalized label itself.
+# Map model labels (lower-cased, underscore-delimited) to the short tag
+# we substitute into the redacted output. 13 entries to match
+# v45_phase3's label set (matches the bench's CATEGORIES.md). Unknown
+# labels fall through to the capitalized label itself.
 LABEL_TAG = {
+    "private_person": "PERSON",
     "private_email": "EMAIL",
     "private_phone": "PHONE",
     "private_address": "ADDRESS",
-    "private_person": "PERSON",
     "private_url": "URL",
+    "private_company": "COMPANY",
+    "private_handle": "HANDLE",
+    "private_channel": "CHANNEL",
+    "private_repo": "REPO",
+    "private_id": "ID",
     "private_date": "DATE",
-    "account_number": "ACCOUNT",
     "secret": "SECRET",
+    "private_sensitive": "SENSITIVE",
+    "account_number": "ACCOUNT",
 }
 
 # Deterministic credential shapes that OPF can miss, especially short or
@@ -204,8 +212,10 @@ app = FastAPI(
 )
 
 # Model handle is a module-level global so FastAPI workers share it.
-_opf: OPF | None = None
-# rfdetr_v8 ONNX session — loaded alongside the text model at startup.
+# `transformers.pipelines.token_classification.TokenClassificationPipeline`
+# instance wrapping the optimum ORTModelForTokenClassification.
+_pipeline = None
+# rfdetr_v9 ONNX session — loaded alongside the text model at startup.
 _image_session = None
 
 # Dynamic-batching state. Initialized in the startup hook so the queue
@@ -227,8 +237,8 @@ def _load_model() -> None:
     30s+ for a cold start, and (b) race with health-check probes during
     deployment rollouts.
     """
-    global _opf
-    log.info("loading bf16 model from %s onto CUDA", MODEL_DIR)
+    global _pipeline
+    log.info("loading v45_phase3 ONNX from %s onto CUDA EP", MODEL_DIR)
     t0 = time.time()
     import torch
     if not torch.cuda.is_available():
@@ -241,19 +251,30 @@ def _load_model() -> None:
             "CUDA-capable host. Check tinfoil-config.yml has gpus:1 + "
             "runtime:nvidia + gpus:all on the container."
         )
-    _opf = OPF(
-        model=MODEL_DIR,
-        device="cuda",
-        output_mode="typed",
-        output_text_only=False,
+
+    # v45_phase3 ships as INT8 ONNX (model_quantized.onnx + tokenizer.json
+    # + config.json). ORT's CUDAExecutionProvider gives GPU acceleration;
+    # the file falls back to CPU EP transparently if CUDA isn't available
+    # on a given host (we already gated above on torch.cuda).
+    from optimum.onnxruntime import ORTModelForTokenClassification
+
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+    ort_model = ORTModelForTokenClassification.from_pretrained(
+        MODEL_DIR,
+        file_name="model_quantized.onnx",
+        provider="CUDAExecutionProvider",
     )
-    runtime = _opf.get_runtime()
-    log.info(
-        "text model loaded in %.1fs (device=%s, dtype=%s)",
-        time.time() - t0,
-        next(runtime.model.parameters()).device,
-        next(runtime.model.parameters()).dtype,
+    _pipeline = pipeline(
+        task="ner",
+        model=ort_model,
+        tokenizer=tok,
+        # "first" assigns each sub-word group's label from the first
+        # token only — matches the bench's reference aggregation and is
+        # more robust on CJK / merged-name spans than "simple".
+        aggregation_strategy="first",
+        device=0,  # CUDA:0; honored by the pipeline's tensor-prep step.
     )
+    log.info("text model loaded in %.1fs", time.time() - t0)
 
 
 @app.on_event("startup")
@@ -366,7 +387,7 @@ async def _start_text_batcher() -> None:
     """Spin up the dynamic-batching worker for /filter.
 
     Must run AFTER `_load_model` because the worker calls into the
-    global `_opf`. FastAPI runs startup hooks in registration
+    global `_pipeline`. FastAPI runs startup hooks in registration
     order, so this is fine as long as we keep it below `_load_model`.
     """
     global _text_batch_queue, _text_batch_task
@@ -436,20 +457,33 @@ async def _text_batch_worker() -> None:
 
 
 def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
-    """Thread-pool wrapper around OPF that preserves the old span shape."""
-    assert _opf is not None
+    """Thread-pool wrapper around the HF `ner` pipeline.
+
+    Kept under its historical name so the batcher (`_text_batch_worker`)
+    doesn't need to know we swapped the underlying model. Returns one
+    span list per input, each span shaped {entity_group, start, end,
+    score} — same shape OPF emitted in v0.5.x.
+    """
+    assert _pipeline is not None
+    # The HF `ner` pipeline pads the batch and runs one CUDA forward
+    # pass per call; passing the list (rather than iterating) is what
+    # lets us amortize that pass across requests.
+    raw = _pipeline(texts, batch_size=len(texts))
+    # For a single-string input HF returns List[dict]; for a list input
+    # it returns List[List[dict]]. Normalize.
+    if texts and isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        raw = [raw]
     out: List[List[dict]] = []
-    for text in texts:
-        result = _opf.redact(text)
+    for spans in raw:
         out.append(
             [
                 {
-                    "entity_group": span.label,
-                    "start": span.start,
-                    "end": span.end,
-                    "score": 1.0,
+                    "entity_group": s["entity_group"],
+                    "start": int(s["start"]),
+                    "end": int(s["end"]),
+                    "score": float(s["score"]),
                 }
-                for span in result.detected_spans
+                for s in spans
             ]
         )
     return out
@@ -459,7 +493,7 @@ def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
 def health() -> dict:
     return {
         "status": "ok",
-        "model_ready": _opf is not None,
+        "model_ready": _pipeline is not None,
         "model": MODEL_ID,
         "image_model_ready": _image_session is not None,
         "image_model": IMAGE_MODEL_ID,
@@ -468,7 +502,7 @@ def health() -> dict:
 
 @app.post("/filter", response_model=FilterResponse)
 async def filter_pii(req: FilterRequest) -> FilterResponse:
-    if _opf is None or _text_batch_queue is None:
+    if _pipeline is None or _text_batch_queue is None:
         # Should never happen if startup ran to completion, but guard anyway —
         # Tinfoil may route traffic before our startup hook finishes on first boot.
         raise HTTPException(status_code=503, detail="model not loaded yet")
