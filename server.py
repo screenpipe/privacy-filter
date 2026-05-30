@@ -45,7 +45,7 @@ import logging
 import os
 import re
 import time
-from typing import List, Tuple
+from typing import List, Optional, Set, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -126,6 +126,50 @@ LABEL_TAG = {
     "account_number": "ACCOUNT",
 }
 
+# screenpipe-redact sends canonical `SpanLabel` snake_case names in the
+# request `labels` field (the desktop "AI PII removal → fields to
+# redact" setting, `piiRedactionLabels`). Map them onto this model's
+# label vocabulary so the per-field choice is honored server-side: the
+# model detects every class but we only redact / return the requested
+# ones. Defaults to secrets-only on the client, so absent or empty =
+# "redact everything we detect" (back-compat for older clients).
+CANONICAL_TO_MODEL = {
+    "person": "private_person",
+    "email": "private_email",
+    "phone": "private_phone",
+    "address": "private_address",
+    "url": "private_url",
+    "company": "private_company",
+    "repo": "private_repo",
+    "handle": "private_handle",
+    "channel": "private_channel",
+    "id": "private_id",
+    "date": "private_date",
+    "secret": "secret",
+    "sensitive": "private_sensitive",
+}
+
+
+def _resolve_allowed_labels(labels: Optional[List[str]]) -> Optional[Set[str]]:
+    """Translate the client's requested labels into this model's label
+    set. Accepts the canonical form (`person`) or the raw model form
+    (`private_person`) for robustness. Returns ``None`` when no usable
+    list is supplied — callers treat that as "no server-side filter" so
+    older clients (and the bare REST API) keep redacting everything.
+    """
+    if not labels:
+        return None
+    allowed: Set[str] = set()
+    for raw in labels:
+        key = raw.strip().lower()
+        if key in CANONICAL_TO_MODEL:
+            allowed.add(CANONICAL_TO_MODEL[key])
+        elif key in LABEL_TAG:  # already a model label
+            allowed.add(key)
+    # An all-unknown list would empty the filter and silently redact
+    # nothing; fall back to "no filter" rather than leak by surprise.
+    return allowed or None
+
 # Deterministic credential shapes that OPF can miss, especially short or
 # prefix-heavy API keys. Keep this pass before the model so obvious secrets
 # are removed even if the learned classifier returns no span.
@@ -162,6 +206,14 @@ class FilterRequest(BaseModel):
     # When true, the response also includes the raw spans so the caller
     # can build their own redaction UI. False keeps the response small.
     include_spans: bool = True
+    # Per-field allow-list (canonical SpanLabel names, e.g.
+    # ["secret", "email", "person"]). Only these classes are redacted.
+    # Absent or empty → redact every class the model detects
+    # (back-compat for clients predating the per-field setting).
+    labels: Optional[List[str]] = Field(
+        None,
+        description="Canonical SpanLabel names to redact; absent = redact all detected classes.",
+    )
 
 
 class PiiSpan(BaseModel):
@@ -184,6 +236,12 @@ class DetectRequest(BaseModel):
     threshold: float = Field(
         0.30,
         description="Per-class sigmoid threshold below which detections are dropped.",
+    )
+    # Per-field allow-list (canonical SpanLabel names). Only regions of
+    # these classes are returned. Absent or empty → return every class.
+    labels: Optional[List[str]] = Field(
+        None,
+        description="Canonical SpanLabel names to return; absent = all detected classes.",
     )
 
 
@@ -514,8 +572,20 @@ async def filter_pii(req: FilterRequest) -> FilterResponse:
             detail=f"text exceeds MAX_INPUT_CHARS={MAX_INPUT_CHARS}",
         )
 
+    # Per-field allow-list (canonical SpanLabel names from the desktop
+    # `piiRedactionLabels` setting). None = redact everything detected.
+    allowed = _resolve_allowed_labels(req.labels)
+    # The deterministic secret pre-pass runs unless the caller explicitly
+    # scoped secrets out. The desktop UI always keeps "secret" on, so this
+    # is normally true; gating it keeps a hypothetical secrets-off request
+    # honest instead of leaking the model's miss-coverage through regex.
+    redact_secrets = allowed is None or "secret" in allowed
+
     t0 = time.time()
-    filtered_text, deterministic_spans, offset_map = _prefilter_secrets(text)
+    if redact_secrets:
+        filtered_text, deterministic_spans, offset_map = _prefilter_secrets(text)
+    else:
+        filtered_text, deterministic_spans, offset_map = text, [], list(range(len(text)))
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     # Hand off to the dynamic batcher and await our slot in the next
@@ -543,6 +613,13 @@ async def filter_pii(req: FilterRequest) -> FilterResponse:
         ],
         filtered_text,
     )
+
+    # Drop classes the caller didn't ask for. The model still ran on
+    # everything (it's one forward pass), we just don't rewrite the
+    # spans outside the allow-list — they're value, not PII, for this
+    # user. Secrets handled by the deterministic pre-pass above.
+    if allowed is not None:
+        model_spans = [s for s in model_spans if s.label.lower() in allowed]
 
     redacted = _redact(filtered_text, model_spans)
     response_spans = deterministic_spans + _map_spans_to_original(
@@ -631,6 +708,8 @@ def image_detect(req: DetectRequest) -> DetectResponse:
     best_score = probs[np.arange(IMAGE_NUM_QUERIES), best_class]
     keep = best_score >= req.threshold
 
+    # Per-field allow-list (canonical SpanLabel names). None = return all.
+    allowed = _resolve_allowed_labels(req.labels)
     detections: List[ImageDetection] = []
     for q in np.where(keep)[0]:
         cx, cy, bw, bh = boxes[q]
@@ -640,10 +719,13 @@ def image_detect(req: DetectRequest) -> DetectResponse:
         h_px = bh * orig_h
         if w_px <= 0 or h_px <= 0:
             continue
+        label = IMAGE_CLASSES[int(best_class[q])]
+        if allowed is not None and label not in allowed:
+            continue
         detections.append(
             ImageDetection(
                 bbox=[int(x1), int(y1), int(w_px), int(h_px)],
-                label=IMAGE_CLASSES[int(best_class[q])],
+                label=label,
                 score=float(best_score[q]),
             )
         )
