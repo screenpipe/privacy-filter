@@ -25,6 +25,7 @@ Files baked (from screenpipe/pii-redactor → v45_phase3_onnx/):
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
@@ -70,7 +71,17 @@ def main() -> None:
             filename=fname,
             local_dir=str(out),
         )
-        actual = sha256_of(Path(cached))
+        # hf_hub_download preserves `subfolder` under local_dir — it writes to
+        # out/<subfolder>/<fname>. But the runtime (server.py::_load_model)
+        # loads MODEL_DIR *flat*: from_pretrained(MODEL_DIR) expects
+        # out/config.json, out/model_quantized.onnx, out/tokenizer.json.
+        # Flatten so the file lives directly at out/<fname>. (Regression from
+        # v0.6.0, which swapped snapshot_download(local_dir=out) — flat — for
+        # hf_hub_download(subfolder=...) — nested — and broke container boot.)
+        final = out / fname
+        if Path(cached).resolve() != final.resolve():
+            shutil.copyfile(cached, final)
+        actual = sha256_of(final)
         if actual != expected_sha:
             raise RuntimeError(
                 f"sha256 mismatch on {fname}:\n"
@@ -80,6 +91,12 @@ def main() -> None:
                 f"was intentionally replaced, update EXPECTED_SHA256 in "
                 f"build_download.py deliberately and rebuild."
             )
+
+    # Drop the now-redundant nested subfolder copy and the HF local-dir cache
+    # so the baked MODEL_DIR contains exactly the flat files the server loads.
+    if subfolder:
+        shutil.rmtree(out / subfolder, ignore_errors=True)
+    shutil.rmtree(out / ".cache", ignore_errors=True)
 
     with open(out / "screenpipe_model_source.json", "w") as f:
         json.dump(
