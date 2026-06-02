@@ -34,6 +34,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The image bakes in Gemma E4B (~16 GB) + the PII models + CUDA base
+      # layers, which overruns the runner's ~14 GB default free space
+      # ("No space left on device"). Reclaim ~30 GB of preinstalled
+      # toolchains we don't use before building.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
       - name: Derive version from tag
         id: version
         run: |
