@@ -525,53 +525,74 @@ def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
     """
     import numpy as np
     assert _session is not None and _tokenizer is not None and _id2label is not None
-    # One padded forward pass per call amortizes the batch across requests.
+    # xlm-roberta-base supports only 512 positions (514 incl. CLS/SEP). A single
+    # >512-token sequence makes the model's position-embedding Expand node fail
+    # ([ONNXRuntimeError] invalid expand shape -> HTTP 500), and plain truncation
+    # would silently drop PII in the tail of long captures (whole-screen OCR).
+    # So WINDOW: tokenize into overflowing <=510-token windows with stride overlap
+    # (so a span on a boundary still lands whole in one window), run them all in a
+    # single padded forward (every window <=512 -> safe), then merge spans back
+    # per source text by char offset. offset_mapping for an overflow window is
+    # relative to its source text; overflow_to_sample_mapping says which text.
+    WIN, STRIDE = 510, 64
     enc = _tokenizer(
         texts,
         return_offsets_mapping=True,
+        return_overflowing_tokens=True,
         return_tensors="np",
         truncation=True,
         padding=True,
-        max_length=MAX_INPUT_TOKENS,
+        max_length=WIN,
+        stride=STRIDE,
     )
-    offsets = enc["offset_mapping"]                       # (B, T, 2)
+    sample_of = enc["overflow_to_sample_mapping"].tolist()   # window -> source-text index
+    offsets = enc["offset_mapping"]                          # (W, T, 2) char offsets into source text
     feed = {
         i.name: enc[i.name].astype(np.int64)
         for i in _session.get_inputs()
         if i.name in enc
     }
-    logits = _session.run(None, feed)[0]                  # (B, T, C)
-    # softmax over the class axis for a per-token confidence
+    logits = _session.run(None, feed)[0]                     # (W, T, C)
     shifted = logits - logits.max(axis=-1, keepdims=True)
     probs = np.exp(shifted)
     probs /= probs.sum(axis=-1, keepdims=True)
-    pred = logits.argmax(axis=-1)                         # (B, T)
+    pred = logits.argmax(axis=-1)                            # (W, T)
 
-    out: List[List[dict]] = []
-    for b in range(len(texts)):
-        spans: List[dict] = []
+    per_text: List[List[dict]] = [[] for _ in texts]
+    for w in range(pred.shape[0]):
+        si = sample_of[w]
         cur: Optional[dict] = None
-        for t, (s, e) in enumerate(offsets[b].tolist()):
-            if s == e:                                    # special / padding token
+        for t, (s, e) in enumerate(offsets[w].tolist()):
+            if s == e:                                       # special / padding token
                 cur = None
                 continue
-            label = _id2label[int(pred[b, t])]
+            label = _id2label[int(pred[w, t])]
             if label == "O":
                 cur = None
                 continue
-            base = label.split("-", 1)[-1]                # strip B-/I-
-            score = float(probs[b, t, pred[b, t]])
-            if cur is not None and cur["entity_group"] == base and not label.startswith("B-"):
+            base = label.split("-", 1)[-1]                   # strip B-/I-
+            score = float(probs[w, t, pred[w, t]])
+            if cur is not None and cur["entity_group"] == base and not label.startswith("B-") and s <= cur["end"]:
                 cur["end"] = int(e)
                 cur["_scores"].append(score)
             else:
                 cur = {"entity_group": base, "start": int(s), "end": int(e), "_scores": [score]}
-                spans.append(cur)
-        out.append([
-            {"entity_group": c["entity_group"], "start": c["start"],
-             "end": c["end"], "score": min(c["_scores"])}
-            for c in spans
-        ])
+                per_text[si].append(cur)
+
+    out: List[List[dict]] = []
+    for spans in per_text:
+        # longest-span-first at each start, so a boundary partial (e.g. "4" of a
+        # split SSN seen in one window) is dropped as contained-in / dup-of the
+        # whole span recovered from the stride-overlapping window.
+        spans.sort(key=lambda x: (x["start"], -x["end"]))
+        kept: List[dict] = []
+        for c in spans:
+            if any(k["entity_group"] == c["entity_group"]
+                   and k["start"] <= c["start"] and k["end"] >= c["end"] for k in kept):
+                continue
+            kept.append(c)
+        out.append([{"entity_group": k["entity_group"], "start": k["start"],
+                     "end": k["end"], "score": min(k["_scores"])} for k in kept])
     return out
 
 
