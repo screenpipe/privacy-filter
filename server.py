@@ -41,6 +41,7 @@ Design choices:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -51,7 +52,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from transformers import AutoTokenizer, pipeline
+from transformers import AutoTokenizer
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
@@ -269,10 +270,12 @@ app = FastAPI(
     ),
 )
 
-# Model handle is a module-level global so FastAPI workers share it.
-# `transformers.pipelines.token_classification.TokenClassificationPipeline`
-# instance wrapping the optimum ORTModelForTokenClassification.
-_pipeline = None
+# Text model handles — module-level globals so FastAPI workers share them.
+# Raw onnxruntime session + tokenizer + id2label (NOT the HF pipeline /
+# optimum wrapper — see _load_model for why).
+_session = None
+_tokenizer = None
+_id2label = None
 # rfdetr_v9 ONNX session — loaded alongside the text model at startup.
 _image_session = None
 
@@ -295,44 +298,37 @@ def _load_model() -> None:
     30s+ for a cold start, and (b) race with health-check probes during
     deployment rollouts.
     """
-    global _pipeline
-    log.info("loading v45_phase3 ONNX from %s onto CUDA EP", MODEL_DIR)
+    global _session, _tokenizer, _id2label
+    import onnxruntime as ort
+    log.info("loading v45_phase3 ONNX from %s", MODEL_DIR)
     t0 = time.time()
-    import torch
-    if not torch.cuda.is_available():
-        # Fail loud rather than silently fall back to CPU — a CPU
-        # fallback would still serve correct PII results, but the whole
-        # point of this build is the GPU speedup, so a missing device
-        # is a deploy-config bug we want to surface immediately.
-        raise RuntimeError(
-            "torch.cuda.is_available() is False — this image expects a "
-            "CUDA-capable host. Check tinfoil-config.yml has gpus:1 + "
-            "runtime:nvidia + gpus:all on the container."
-        )
 
-    # v45_phase3 ships as INT8 ONNX (model_quantized.onnx + tokenizer.json
-    # + config.json). ORT's CUDAExecutionProvider gives GPU acceleration;
-    # the file falls back to CPU EP transparently if CUDA isn't available
-    # on a given host (we already gated above on torch.cuda).
-    from optimum.onnxruntime import ORTModelForTokenClassification
+    # v45_phase3 is an INT8 ONNX xlm-roberta token classifier
+    # (model_quantized.onnx + tokenizer.json + config.json, flat in
+    # MODEL_DIR). We load it with raw onnxruntime and run a manual BIO
+    # decode (see _opf_on_batch) — the SAME approach the desktop app and
+    # the bench use. We deliberately do NOT use optimum + the HF `ner`
+    # pipeline: (a) optimum's import is brittle across transformers
+    # versions (it crash-looped the container on `is_tf_available`), and
+    # (b) the pipeline's span aggregation returns NO entities for this
+    # tokenizer, which would silently pass all PII through.
+    _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    with open(os.path.join(MODEL_DIR, "config.json")) as f:
+        _id2label = {int(k): v for k, v in json.load(f)["id2label"].items()}
 
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-    ort_model = ORTModelForTokenClassification.from_pretrained(
-        MODEL_DIR,
-        file_name="model_quantized.onnx",
-        provider="CUDAExecutionProvider",
+    # CUDA EP for GPU acceleration; CPU EP as a transparent fallback so a
+    # missing/mismatched CUDA stack degrades to (correct, slower) CPU
+    # inference instead of crash-looping the whole container.
+    _session = ort.InferenceSession(
+        os.path.join(MODEL_DIR, "model_quantized.onnx"),
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
-    _pipeline = pipeline(
-        task="ner",
-        model=ort_model,
-        tokenizer=tok,
-        # "first" assigns each sub-word group's label from the first
-        # token only — matches the bench's reference aggregation and is
-        # more robust on CJK / merged-name spans than "simple".
-        aggregation_strategy="first",
-        device=0,  # CUDA:0; honored by the pipeline's tensor-prep step.
-    )
-    log.info("text model loaded in %.1fs", time.time() - t0)
+    active = _session.get_providers()
+    if "CUDAExecutionProvider" not in active:
+        log.warning(
+            "text model running WITHOUT CUDA (providers=%s) — results are "
+            "correct but slower; check onnxruntime-gpu + CUDA libs", active)
+    log.info("text model loaded in %.1fs (providers=%s)", time.time() - t0, active)
 
 
 @app.on_event("startup")
@@ -445,7 +441,7 @@ async def _start_text_batcher() -> None:
     """Spin up the dynamic-batching worker for /filter.
 
     Must run AFTER `_load_model` because the worker calls into the
-    global `_pipeline`. FastAPI runs startup hooks in registration
+    loaded `_session`. FastAPI runs startup hooks in registration
     order, so this is fine as long as we keep it below `_load_model`.
     """
     global _text_batch_queue, _text_batch_task
@@ -515,35 +511,67 @@ async def _text_batch_worker() -> None:
 
 
 def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
-    """Thread-pool wrapper around the HF `ner` pipeline.
+    """Run the ONNX text model over a batch; return one span list per
+    input, each span shaped {entity_group, start, end, score} — the same
+    shape OPF emitted in v0.5.x, so the batcher / `/filter` handler are
+    unchanged.
 
-    Kept under its historical name so the batcher (`_text_batch_worker`)
-    doesn't need to know we swapped the underlying model. Returns one
-    span list per input, each span shaped {entity_group, start, end,
-    score} — same shape OPF emitted in v0.5.x.
+    Manual BIO decode over (offset_mapping, argmax): group consecutive
+    non-`O` tokens that share a base label into a span, locate it by the
+    tokenizer's char offsets. The model detects every class but the
+    server only rewrites the subset in `_filter_labels`. We decode here
+    rather than via the HF `ner` pipeline because that pipeline's
+    aggregation returns no entities for this tokenizer.
     """
-    assert _pipeline is not None
-    # The HF `ner` pipeline pads the batch and runs one CUDA forward
-    # pass per call; passing the list (rather than iterating) is what
-    # lets us amortize that pass across requests.
-    raw = _pipeline(texts, batch_size=len(texts))
-    # For a single-string input HF returns List[dict]; for a list input
-    # it returns List[List[dict]]. Normalize.
-    if texts and isinstance(raw, list) and raw and isinstance(raw[0], dict):
-        raw = [raw]
+    import numpy as np
+    assert _session is not None and _tokenizer is not None and _id2label is not None
+    # One padded forward pass per call amortizes the batch across requests.
+    enc = _tokenizer(
+        texts,
+        return_offsets_mapping=True,
+        return_tensors="np",
+        truncation=True,
+        padding=True,
+        max_length=MAX_INPUT_TOKENS,
+    )
+    offsets = enc["offset_mapping"]                       # (B, T, 2)
+    feed = {
+        i.name: enc[i.name].astype(np.int64)
+        for i in _session.get_inputs()
+        if i.name in enc
+    }
+    logits = _session.run(None, feed)[0]                  # (B, T, C)
+    # softmax over the class axis for a per-token confidence
+    shifted = logits - logits.max(axis=-1, keepdims=True)
+    probs = np.exp(shifted)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    pred = logits.argmax(axis=-1)                         # (B, T)
+
     out: List[List[dict]] = []
-    for spans in raw:
-        out.append(
-            [
-                {
-                    "entity_group": s["entity_group"],
-                    "start": int(s["start"]),
-                    "end": int(s["end"]),
-                    "score": float(s["score"]),
-                }
-                for s in spans
-            ]
-        )
+    for b in range(len(texts)):
+        spans: List[dict] = []
+        cur: Optional[dict] = None
+        for t, (s, e) in enumerate(offsets[b].tolist()):
+            if s == e:                                    # special / padding token
+                cur = None
+                continue
+            label = _id2label[int(pred[b, t])]
+            if label == "O":
+                cur = None
+                continue
+            base = label.split("-", 1)[-1]                # strip B-/I-
+            score = float(probs[b, t, pred[b, t]])
+            if cur is not None and cur["entity_group"] == base and not label.startswith("B-"):
+                cur["end"] = int(e)
+                cur["_scores"].append(score)
+            else:
+                cur = {"entity_group": base, "start": int(s), "end": int(e), "_scores": [score]}
+                spans.append(cur)
+        out.append([
+            {"entity_group": c["entity_group"], "start": c["start"],
+             "end": c["end"], "score": min(c["_scores"])}
+            for c in spans
+        ])
     return out
 
 
@@ -551,7 +579,7 @@ def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
 def health() -> dict:
     return {
         "status": "ok",
-        "model_ready": _pipeline is not None,
+        "model_ready": _session is not None,
         "model": MODEL_ID,
         "image_model_ready": _image_session is not None,
         "image_model": IMAGE_MODEL_ID,
@@ -560,7 +588,7 @@ def health() -> dict:
 
 @app.post("/filter", response_model=FilterResponse)
 async def filter_pii(req: FilterRequest) -> FilterResponse:
-    if _pipeline is None or _text_batch_queue is None:
+    if _session is None or _text_batch_queue is None:
         # Should never happen if startup ran to completion, but guard anyway —
         # Tinfoil may route traffic before our startup hook finishes on first boot.
         raise HTTPException(status_code=503, detail="model not loaded yet")

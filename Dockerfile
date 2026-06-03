@@ -38,9 +38,14 @@ COPY requirements.txt /app/requirements.txt
 # Two-phase install:
 #   1) FastAPI / pydantic / httpx / huggingface_hub — safe to let pip
 #      resolve.
-#   2) transformers / tokenizers / accelerate / safetensors / optimum /
-#      onnxruntime-gpu / pillow / numpy — torch-adjacent, install with
-#      --no-deps so torch stays at the version the base image ships.
+#   2) transformers (tokenizer only) / tokenizers / accelerate /
+#      safetensors / onnxruntime-gpu / pillow / numpy — torch-adjacent,
+#      install with --no-deps so torch stays at the version the base ships.
+#      transformers is pinned to 4.46.x: it's used ONLY for AutoTokenizer
+#      (the model runs via raw onnxruntime, not optimum), and 4.46.x is the
+#      last line compatible with the base's huggingface_hub 0.26.2. (5.6.0
+#      needs hub>=1.5 → ImportError; optimum needs transformers<5 → both
+#      crash-looped the container. We dropped optimum entirely.)
 RUN pip install --no-cache-dir \
         fastapi==0.115.4 \
         "uvicorn[standard]==0.32.0" \
@@ -48,12 +53,11 @@ RUN pip install --no-cache-dir \
         httpx==0.27.2 \
         huggingface_hub==0.26.2 \
  && pip install --no-cache-dir --no-deps \
-        transformers==5.6.0 \
-        tokenizers==0.22.1 \
+        transformers==4.46.3 \
+        tokenizers==0.20.3 \
         accelerate==1.1.1 \
         safetensors==0.4.5 \
         onnxruntime-gpu==1.20.1 \
-        optimum==1.23.3 \
         pillow==11.0.0 \
         numpy==2.1.3
 
