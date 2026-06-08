@@ -56,7 +56,7 @@ from transformers import AutoTokenizer
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
-MODEL_ID = os.environ.get("MODEL_ID", "screenpipe/pii-redactor:v45_phase3 (int8-onnx)")
+MODEL_ID = os.environ.get("MODEL_ID", "screenpipe/pii-redactor:v45_phase4 (int8-onnx)")
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
 # Request coalescing for /filter. The HF `ner` pipeline accepts a list
@@ -84,10 +84,10 @@ _HOP_BY_HOP_HEADERS = frozenset([
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
 ])
 
-# ── Image-PII detector (rfdetr_v8) ──────────────────────────────────────
+# ── Image-PII detector (rfdetr_v12) ─────────────────────────────────────
 # Path to the ONNX. Baked in by the Dockerfile from
 # huggingface.co/screenpipe/pii-image-redactor.
-IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v8.onnx")
+IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v12.onnx")
 IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v9")
 # Reject images larger than this (decoded). Defends against an
 # adversarial 100-MB JPEG of a 50K×50K canvas blowing up enclave RAM.

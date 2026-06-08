@@ -12,7 +12,7 @@
 # tweaks) and ships ready-to-run. We don't actually use the 31B weights;
 # the base is just a convenient vLLM distribution.
 #
-# Our FastAPI server, OPF text model, rfdetr_v9 image model, and the
+# Our FastAPI server, v45_phase4 text model, rfdetr_v12 image model, and the
 # baked-in Gemma 4 E4B weights are installed on top. `entrypoint.sh`
 # starts vLLM (E4B) in the background and uvicorn in the foreground.
 #
@@ -61,19 +61,20 @@ RUN pip install --no-cache-dir \
         pillow==11.0.0 \
         numpy==2.1.3
 
-# Download the ScreenPipe v45_phase3 text PII redactor — INT8 ONNX,
+# Download the ScreenPipe v45_phase4 text PII redactor — INT8 ONNX,
 # ~278 MB on disk (model_quantized.onnx + tokenizer.json + config.json).
-# Same checkpoint the desktop app downloads on first run, so the
-# container's /filter output matches what local clients produce.
+# The enclave runs the FULL (un-pruned) checkpoint for maximum accuracy —
+# the desktop app ships the vocab-pruned v45_phase5 for RAM, but the cloud
+# has no RAM constraint, so we serve the most performing model here.
 #
 # Build-time download with per-file SHA-256 verification (in
 # build_download.py); the resulting image hash is reproducible across
 # rebuilds and covered by Tinfoil's remote attestation measurement.
 ARG SOURCE_MODEL_ID=screenpipe/pii-redactor
 ARG SOURCE_MODEL_REVISION=main
-ARG SOURCE_MODEL_SUBFOLDER=v45_phase3_onnx
+ARG SOURCE_MODEL_SUBFOLDER=v45_phase4_onnx
 ENV MODEL_DIR=/opt/model \
-    MODEL_ID="screenpipe/pii-redactor:v45_phase3 (int8-onnx)"
+    MODEL_ID="screenpipe/pii-redactor:v45_phase4 (int8-onnx)"
 COPY build_download.py /tmp/build_download.py
 RUN useradd --system --no-create-home --uid 10001 appuser \
     && SOURCE_MODEL_ID=$SOURCE_MODEL_ID \
@@ -88,9 +89,9 @@ RUN useradd --system --no-create-home --uid 10001 appuser \
 # build time with SHA-256 verification so the resulting image hash is
 # reproducible across rebuilds.
 ARG IMAGE_MODEL_HF_REPO=screenpipe/pii-image-redactor
-ARG IMAGE_MODEL_HF_FILE=rfdetr_v9.onnx
-ARG IMAGE_MODEL_SHA256=179a5e08ab12bfc70ff1e8dc1e2a67379de2a3be93eb2e7e1f8ec3dbd973f662
-ENV IMAGE_MODEL_PATH=/opt/rfdetr_v8.onnx
+ARG IMAGE_MODEL_HF_FILE=rfdetr_v12.onnx
+ARG IMAGE_MODEL_SHA256=13912b66f17f74839e6d07c2399f5b11fd98523f26e78ac7bdaa676472129cb3
+ENV IMAGE_MODEL_PATH=/opt/rfdetr_v12.onnx
 ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
     https://huggingface.co/${IMAGE_MODEL_HF_REPO}/resolve/main/${IMAGE_MODEL_HF_FILE} \
     ${IMAGE_MODEL_PATH}

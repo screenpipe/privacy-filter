@@ -37,12 +37,13 @@ from huggingface_hub import hf_hub_download
 # need to bump the constant deliberately. Build-time SHA pinning is
 # the moat against silent weight swaps.
 EXPECTED_SHA256: dict[str, str] = {
+    # v45_phase4_onnx (full, un-pruned — the enclave serves max accuracy)
     "model_quantized.onnx":
-        "77bb202c542bcd3f835992cde3cafb3df868a8a6fc14ca9d1b028452be6b5787",
+        "286c628349c0145fdfbfc773cd44a6e22680abb42b00730d6ec78d366aac610b",
     "tokenizer.json":
-        "14c7e8bf7d9b58ca061fcda93bc8d0eedd1a51ffc3af01a1ba1ef54e2154887e",
+        "d0091a328b3441d754e481db5a390d7f3b8dabc6016869fd13ba350d23ddc4cd",
     "config.json":
-        "e9a8a3dda702b9efa2b9b5960567a560bf410e92e619184081dd3c9e9990b35d",
+        "61dc24e4e4816d723143974268ef0b7a303d4b1f208bdd96db4d38a3359036f2",
 }
 
 
