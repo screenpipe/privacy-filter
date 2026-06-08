@@ -90,7 +90,7 @@ RUN useradd --system --no-create-home --uid 10001 appuser \
 # reproducible across rebuilds.
 ARG IMAGE_MODEL_HF_REPO=screenpipe/pii-image-redactor
 ARG IMAGE_MODEL_HF_FILE=rfdetr_v12.onnx
-ARG IMAGE_MODEL_SHA256=13912b66f17f74839e6d07c2399f5b11fd98523f26e78ac7bdaa676472129cb3
+ARG IMAGE_MODEL_SHA256=71cd7d976ef769255a8d5b7523ecdd547710cc18f8464e0cc9da64c4e8c1aaba
 ENV IMAGE_MODEL_PATH=/opt/rfdetr_v12.onnx
 ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
     https://huggingface.co/${IMAGE_MODEL_HF_REPO}/resolve/main/${IMAGE_MODEL_HF_FILE} \
