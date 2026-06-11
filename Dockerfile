@@ -88,6 +88,13 @@ RUN useradd --system --no-create-home --uid 10001 appuser \
 # Image-PII detector. Same auto-download pattern as before — baked at
 # build time with SHA-256 verification so the resulting image hash is
 # reproducible across rebuilds.
+# rfdetr_v12 = fp16 export of the "realworld" retrain (512×512, ~54 MB) —
+# same weights the desktop app ships as v11 fp32. v9 (384px) over-detected
+# on real screens (97% synthetic -> ~1% real precision); the realworld
+# retrain closed that gap. fp16 halves the download and runs natively on
+# the CUDA EP. Input takes float32 (only the weights are fp16). server.py
+# auto-detects the 512px input size from the ONNX at load — the previous
+# hardcoded 384 broke /image/detect with a static-shape mismatch (v0.7.4).
 ARG IMAGE_MODEL_HF_REPO=screenpipe/pii-image-redactor
 ARG IMAGE_MODEL_HF_FILE=rfdetr_v12.onnx
 ARG IMAGE_MODEL_SHA256=71cd7d976ef769255a8d5b7523ecdd547710cc18f8464e0cc9da64c4e8c1aaba
