@@ -135,9 +135,14 @@ RUN chmod +x /entrypoint.sh
 USER root
 
 EXPOSE 8080
+# /healthz (not /health): it folds in the gemma-restart policy — 503 once
+# the co-hosted vLLM has been continuously down past GEMMA_UNHEALTHY_AFTER,
+# so the orchestrator recycles the container only when the in-container
+# supervisor restarts (entrypoint.sh) aren't sticking. urlopen raises on
+# 5xx, which exits non-zero via the `|| exit 1`.
 HEALTHCHECK --interval=15s --timeout=5s --retries=10 --start-period=1800s \
     CMD python3 -c "import urllib.request,sys; \
-r=urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3); \
+r=urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3); \
 sys.exit(0 if r.status==200 else 1)" || exit 1
 
 # Override the base image's `vllm serve` entrypoint with our launcher

@@ -53,14 +53,21 @@ containers:
       - GEMMA_UPSTREAM: "http://127.0.0.1:8001"
     restart: "always"
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      # /healthz (not /health) folds in the gemma-restart policy: 200 while
+      # gemma is up or while entrypoint.sh's supervisor is restarting a
+      # crashed vLLM; 503 once gemma has been continuously down past
+      # GEMMA_UNHEALTHY_AFTER (default 900 s) — i.e. restarts aren't
+      # sticking — so Tinfoil recycles the whole attested container.
+      # urlopen raises on the 503, failing the check.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
       interval: "15s"
       timeout: "5s"
       retries: 10
       # 10 min grace — E4B BF16 weight load from the image to VRAM is
       # ~30 s plus a few seconds of CUDA graph compile. The privacy
-      # filter /health endpoint comes up first; it does NOT wait for
-      # vLLM so /filter is responsive even while E4B is still loading.
+      # filter /healthz endpoint comes up first and stays 200 while E4B
+      # is still loading (the 900 s downtime grace covers boot), so
+      # /filter is responsive immediately.
       start_period: "600s"
 
 shim:

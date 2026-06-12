@@ -21,7 +21,10 @@ single attestation measurement = one client config (one URL, one auth
 token).
 
 Endpoints:
-    GET  /health        -> {"status": "ok", ...}
+    GET  /health        -> {"status": "ok", ..., "gemma_ready": bool}
+    GET  /healthz       -> container-healthcheck policy: 503 once gemma has
+                          been continuously down > GEMMA_UNHEALTHY_AFTER
+                          (loopback only — not exposed through the shim)
     POST /filter        -> {"text": "..."} -> {"redacted": "...", "spans": [...]}
     POST /image/detect  -> {"image_b64": "...", "threshold": 0.30}
                           -> {"detections": [{"bbox":[x,y,w,h],"label":"...","score":0.95}, ...]}
@@ -290,6 +293,19 @@ _text_batch_task: "asyncio.Task | None" = None
 # so the connection pool is shared across requests (vLLM keepalive helps
 # under concurrent /v1/chat/completions load).
 _gemma_client: "httpx.AsyncClient | None" = None
+
+# Gemma upstream liveness, fed by _probe_gemma() (called from /health and
+# /healthz) and by successful /v1/* proxy round-trips. `_gemma_last_ok =
+# None` means "never seen up since process start" — downtime is then
+# measured from `_gemma_started` so a vLLM that never comes up still trips
+# /healthz once the grace below runs out.
+_gemma_started: float = time.time()
+_gemma_last_ok: "float | None" = None
+# How long gemma may stay continuously unreachable before /healthz reports
+# 503 and the container healthcheck recycles the CVM. entrypoint.sh
+# restarts a crashed vLLM with ≤300 s backoff, so 900 s of continuous
+# downtime means in-container restarts aren't sticking.
+GEMMA_UNHEALTHY_AFTER = float(os.environ.get("GEMMA_UNHEALTHY_AFTER", "900"))
 
 
 @app.on_event("startup")
@@ -609,14 +625,75 @@ def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
     return out
 
 
+async def _probe_gemma() -> bool:
+    """Liveness probe of the co-hosted vLLM (GET /health on loopback).
+
+    Cheap (~1 ms) — called from /health and /healthz, i.e. every container
+    healthcheck tick. Updates `_gemma_last_ok` so downtime is measured as a
+    continuous window rather than an instantaneous state.
+    """
+    global _gemma_last_ok
+    if _gemma_client is None:
+        return False
+    try:
+        r = await _gemma_client.get("/health", timeout=2.0)
+    except httpx.HTTPError:
+        return False
+    if r.status_code == 200:
+        _gemma_last_ok = time.time()
+        return True
+    return False
+
+
+def _gemma_down_seconds(ready: bool) -> float:
+    if ready:
+        return 0.0
+    return time.time() - (_gemma_last_ok if _gemma_last_ok is not None else _gemma_started)
+
+
 @app.get("/health")
-def health() -> dict:
+async def health() -> dict:
+    gemma_ready = await _probe_gemma()
     return {
         "status": "ok",
         "model_ready": _session is not None,
         "model": MODEL_ID,
         "image_model_ready": _image_session is not None,
         "image_model": IMAGE_MODEL_ID,
+        "gemma_ready": gemma_ready,
+        "gemma_model": "gemma4-e4b",
+        "gemma_down_seconds": round(_gemma_down_seconds(gemma_ready), 1),
+    }
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz() -> dict:
+    """Container-healthcheck policy endpoint (loopback only — /healthz is
+    NOT in the Tinfoil shim's path allow-list, so it is unreachable from
+    outside the enclave).
+
+    Stays 200 while gemma is up, or while it has been down for less than
+    GEMMA_UNHEALTHY_AFTER seconds (entrypoint.sh's supervisor is busy
+    restarting it). Turns 503 only when restarts aren't sticking, so
+    Tinfoil recycles the attested container — without sacrificing the PII
+    /filter path to every transient vLLM crash. /health (shim-exposed)
+    never goes unhealthy for gemma reasons; external monitors read its
+    `gemma_ready` / `gemma_down_seconds` fields instead.
+    """
+    gemma_ready = await _probe_gemma()
+    down_for = _gemma_down_seconds(gemma_ready)
+    if not gemma_ready and down_for > GEMMA_UNHEALTHY_AFTER:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"gemma upstream continuously down for {down_for:.0f}s "
+                f"(threshold {GEMMA_UNHEALTHY_AFTER:.0f}s)"
+            ),
+        )
+    return {
+        "status": "ok",
+        "gemma_ready": gemma_ready,
+        "gemma_down_seconds": round(down_for, 1),
     }
 
 
@@ -946,12 +1023,16 @@ async def proxy_to_gemma(path: str, request: Request):
         content=body,
         params=request.query_params,
     )
+    global _gemma_last_ok
     try:
         upstream = await _gemma_client.send(upstream_req, stream=True)
     except httpx.RequestError as e:
         # vLLM is co-tenant — if it's down we surface 502 rather than a 500.
         log.warning("gemma upstream request error for /v1/%s: %s", path, e)
         raise HTTPException(status_code=502, detail=f"gemma upstream unreachable: {e}")
+    # Any upstream HTTP response (even a 4xx) proves the vLLM process is
+    # alive — feed the liveness window used by /health and /healthz.
+    _gemma_last_ok = time.time()
 
     resp_headers = {
         k: v for k, v in upstream.headers.items()
