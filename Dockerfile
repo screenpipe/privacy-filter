@@ -104,25 +104,30 @@ ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
     ${IMAGE_MODEL_PATH}
 RUN chown appuser:appuser ${IMAGE_MODEL_PATH}
 
-# Gemma 4 E4B (BF16) — chat + vision + native audio. ~16 GB on disk.
+# Gemma 4 E2B (BF16) — chat + vision + native audio. ~10 GB on disk.
+# We serve E2B (not E4B): it has the same native-audio capability but a
+# much smaller VRAM/load footprint, so vLLM starts reliably on the shared
+# H200 allocation where E4B (16 GB) was failing to come up. The API model
+# id stays `gemma4-e4b` (see entrypoint --served-model-name) so the
+# gateway and all clients are unchanged.
 # Pinned to the exact revision so the attestation measurement is stable
-# across rebuilds. E4B (and E2B) are the only Gemma 4 variants with
+# across rebuilds. E2B (and E4B) are the only Gemma 4 variants with
 # native audio understanding — the 26B and 31B don't have audio at all.
 #
-# E4B is NOT on Tinfoil's modelwrap system yet, so we ship the weights
+# E2B is NOT on Tinfoil's modelwrap system yet, so we ship the weights
 # inside the image. The Gemma Terms of Use permit redistribution;
 # downstream consumers still must accept terms via HuggingFace if they
-# want to download the model directly. Image grows ~16 GB; Tinfoil's
-# ramdisk-backed deploy path handles it (memory bumped to 96 GB).
-ARG GEMMA_E4B_REPO=google/gemma-4-E4B-it
-ARG GEMMA_E4B_REVISION=3555bddc93a623db8887dd2e52123facc45ade77
-ENV GEMMA_E4B_DIR=/opt/gemma-4-E4B-it
+# want to download the model directly. Image grows ~10 GB; Tinfoil's
+# ramdisk-backed deploy path handles it.
+ARG GEMMA_E2B_REPO=google/gemma-4-E2B-it
+ARG GEMMA_E2B_REVISION=70af34e20bd4b7a91f0de6b22675850c43922a03
+ENV GEMMA_E2B_DIR=/opt/gemma-4-E2B-it
 RUN python3 -c "from huggingface_hub import snapshot_download; \
-                snapshot_download('${GEMMA_E4B_REPO}', \
-                                  revision='${GEMMA_E4B_REVISION}', \
-                                  local_dir='${GEMMA_E4B_DIR}', \
+                snapshot_download('${GEMMA_E2B_REPO}', \
+                                  revision='${GEMMA_E2B_REVISION}', \
+                                  local_dir='${GEMMA_E2B_DIR}', \
                                   local_dir_use_symlinks=False)" \
-    && chown -R appuser:appuser ${GEMMA_E4B_DIR}
+    && chown -R appuser:appuser ${GEMMA_E2B_DIR}
 
 COPY --chown=appuser:appuser server.py /app/server.py
 COPY --chown=appuser:appuser entrypoint.sh /entrypoint.sh

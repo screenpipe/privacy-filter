@@ -42,12 +42,15 @@
 
 set -euo pipefail
 
-# E4B weights ship inside the image (baked by Dockerfile, pinned revision).
+# E2B weights ship inside the image (baked by Dockerfile, pinned revision).
 # Not on Tinfoil's modelwrap volume — the 31B is, but we don't run it here.
-GEMMA_E4B_DIR="${GEMMA_E4B_DIR:-/opt/gemma-4-E4B-it}"
+# We serve E2B (not E4B): same native-audio capability, far smaller VRAM/
+# load footprint so vLLM actually starts on the shared H200 where E4B
+# (16 GB) was failing to come up. API id stays gemma4-e4b (below).
+GEMMA_E2B_DIR="${GEMMA_E2B_DIR:-/opt/gemma-4-E2B-it}"
 GEMMA_PORT="${GEMMA_PORT:-8001}"
 APP_PORT="${PORT:-8080}"
-# 0.25 of 141 GB H200 = ~35 GB total. Weights 16 GB BF16 + KV ~19 GB.
+# 0.25 of 141 GB H200 = ~35 GB total. Weights ~10 GB BF16 + KV.
 # Audio queries are 30-s bounded (~750 tokens) and chats fit in <8 K, so
 # we don't need a huge KV pool. Leaves ~89 GB for the privacy-filter
 # (~16 GB peak) plus comfortable CUDA workspace.
@@ -72,12 +75,12 @@ GEMMA_WATCHDOG_FAILS="${GEMMA_WATCHDOG_FAILS:-3}"
 (
     backoff="${GEMMA_RESTART_BACKOFF_MIN}"
     while true; do
-        echo "[entrypoint] launching vLLM (gemma4-e4b) on :${GEMMA_PORT}"
-        echo "[entrypoint]   weights: ${GEMMA_E4B_DIR}"
+        echo "[entrypoint] launching vLLM (gemma4-e4b id; E2B weights) on :${GEMMA_PORT}"
+        echo "[entrypoint]   weights: ${GEMMA_E2B_DIR}"
         echo "[entrypoint]   gpu_memory_utilization: ${GPU_MEM_UTIL}"
         started_at="$(date +%s)"
         rc=0
-        vllm serve "${GEMMA_E4B_DIR}" \
+        vllm serve "${GEMMA_E2B_DIR}" \
             --tensor-parallel-size 1 \
             --gpu-memory-utilization "${GPU_MEM_UTIL}" \
             --served-model-name gemma4-e4b \
