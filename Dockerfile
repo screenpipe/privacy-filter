@@ -46,6 +46,10 @@ COPY requirements.txt /app/requirements.txt
 #      last line compatible with the base's huggingface_hub 0.26.2. (5.6.0
 #      needs hub>=1.5 → ImportError; optimum needs transformers<5 → both
 #      crash-looped the container. We dropped optimum entirely.)
+#      NOTE (v0.7.9): this 4.46.3 is OVERRIDDEN to transformers 5.12.1 in a
+#      RUN after the model downloads below — the co-hosted vLLM needs it to
+#      recognize the gemma4_audio model. The redactor's XLMRobertaTokenizer
+#      loads fine at 5.12.1 (verified live), and hub upgrades cleanly to 1.x.
 RUN pip install --no-cache-dir \
         fastapi==0.115.4 \
         "uvicorn[standard]==0.32.0" \
@@ -128,6 +132,21 @@ RUN python3 -c "from huggingface_hub import snapshot_download; \
                                   local_dir='${GEMMA_E2B_DIR}', \
                                   local_dir_use_symlinks=False)" \
     && chown -R appuser:appuser ${GEMMA_E2B_DIR}
+
+# ── Dependency fix (v0.7.9) — the real cause of the v0.5–v0.7.8 gemma outage.
+# The pins above (transformers 4.46.3, forced by huggingface_hub==0.26.2) are
+# fine for the privacy-filter's AutoTokenizer but TOO OLD for the co-hosted
+# vLLM: vLLM 0.20.1 imports `Gemma3Config` (needs transformers>=4.56) and the
+# served model is `gemma4_audio`, recognized only by transformers>=5.12
+# (`Gemma4Config`). With 4.46.3, `vllm serve` crash-looped at import for days
+# and never touched the GPU — which looked like a GPU/host fault but wasn't.
+# Verified live in the debug CVM: 5.12.1 loads gemma4_audio (E2B) onto the
+# H200 and serves, AND the redactor's XLMRobertaTokenizer still loads.
+# Installed WITH deps (pulls huggingface_hub 1.x + tokenizers 0.22; torch
+# is unchanged). pydantic>=2.12 satisfies vLLM 0.20.1. The build-time assert
+# fails the image if this ever regresses.
+RUN pip install --no-cache-dir 'transformers==5.12.1' 'pydantic>=2.12,<3' \
+ && python3 -c "import transformers; from transformers import Gemma3Config, Gemma4Config, AutoTokenizer; AutoTokenizer.from_pretrained('/opt/model'); print('dep-fix OK: transformers', transformers.__version__)"
 
 COPY --chown=appuser:appuser server.py /app/server.py
 COPY --chown=appuser:appuser entrypoint.sh /entrypoint.sh
