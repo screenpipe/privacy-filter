@@ -2,11 +2,11 @@
 
 GPU-backed HTTP wrapper around two PII models plus a co-hosted Gemma chat model, in one Tinfoil container:
 
-1. [`screenpipe/pii-text-redactor`](https://huggingface.co/screenpipe/pii-text-redactor) revision `v6` — ScreenPipe fine-tuned OPF 1.5B-param MoE (50M active) token classifier for **text PII**. Endpoint `POST /filter`.
-2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v9`) — RF-DETR-Nano detector for **image PII** in screenshots. Endpoint `POST /image/detect`.
-3. **[v0.5.0+]** [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) — chat + vision + **audio** via vLLM. Endpoint `POST /v1/chat/completions` with `model: "gemma4-e4b"`. Weights baked into the image (~16 GB BF16) since Tinfoil hasn't wrapped E4B yet. E4B is the only Gemma 4 variant with native audio understanding.
+1. [`screenpipe/pii-redactor`](https://huggingface.co/screenpipe/pii-redactor) (`v50_distilled6l`) — six-layer, vocab-pruned XLM-R token classifier for **text PII**. Endpoint `POST /filter`.
+2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v19`) — RF-DETR-Nano detector for **image PII** in screenshots, trained on real-app and synthetic screens. Endpoint `POST /image/detect`.
+3. [`google/gemma-4-E2B-it`](https://huggingface.co/google/gemma-4-E2B-it) — chat + vision + **audio** via vLLM. Endpoint `POST /v1/chat/completions` with the backwards-compatible API model id `"gemma4-e4b"`. Weights are baked into the image (~10 GB BF16).
 
-> **Note:** the 31B model (`gemma4-31b`) is **not** in this container. It stays on Tinfoil's hosted `inference.tinfoil.sh` endpoint, reached separately by `packages/ai-gateway` in the Cloudflare worker. E4B is a different model — smaller, multimodal-audio, lower-cost — not a drop-in replacement.
+> **Note:** the 31B model (`gemma4-31b`) is **not** in this container. It stays on Tinfoil's hosted `inference.tinfoil.sh` endpoint, reached separately by `packages/ai-gateway` in the Cloudflare worker. The co-hosted E2B is a smaller multimodal-audio model, not a drop-in replacement.
 
 All three workloads deploy inside the same [Tinfoil](https://tinfoil.sh) confidential-compute container on one H200 (~141 GB VRAM) so neither pixels, text, nor chat prompts leave an attested runtime. The shim only publishes uvicorn on `:8080`; `/v1/*` requests are reverse-proxied to vLLM on `127.0.0.1:8001`. One TLS-attested URL, one auth token, three workloads sharing one allocation.
 
@@ -20,16 +20,16 @@ POST /filter         → {"text": "My email is alice@foo.com"}
                         "spans": [{"label": "private_email", "start": 12, "end": 25,
                                    "text": "alice@foo.com", "score": 0.99}],
                         "latency_ms": 180,
-                        "model": "screenpipe/pii-text-redactor:v6 (bf16-cuda)"}
+                        "model": "screenpipe/pii-redactor:v50_distilled6l (mixed-int4-int8-onnx)"}
 
 POST /image/detect   → {"image_b64": "<b64-jpg-or-png>", "threshold": 0.30}
                     ←  {"detections": [{"bbox": [x, y, w, h], "label": "private_person", "score": 0.95},
                                        {"bbox": [x, y, w, h], "label": "secret",        "score": 0.91}],
-                        "latency_ms": 32, "model": "rfdetr_v8",
+                        "latency_ms": 32, "model": "rfdetr_v19",
                         "width": 2880, "height": 1800}
 ```
 
-Bbox is `[x, y, w, h]` in ORIGINAL-image pixel space (the server un-resizes from its 320×320 internal input). Labels are the canonical 12-class screenpipe PII taxonomy.
+Bbox is `[x, y, w, h]` in original-image pixel space (the server un-resizes from the model's 512×512 input). Labels are the canonical 12-class screenpipe PII taxonomy.
 
 ## Local development
 
@@ -53,29 +53,26 @@ curl -s -X POST http://localhost:8080/image/detect \
      -d "$(jq -nc --arg img "$B64" '{image_b64: $img, threshold: 0.30}')" | jq
 ```
 
-First build pre-downloads the ScreenPipe fine-tuned OPF text model (~3 GB bf16) AND the 108 MB rfdetr_v8 ONNX into the image, so expect a 5–10 min initial build. Subsequent builds hit Docker's layer cache. The text model is pinned to HuggingFace revision `v6`, and the tokenizer is pinned to the upstream OPF commit in the `Dockerfile`; the image-model `ADD --checksum=` directive verifies the SHA-256 against the value pinned in the `Dockerfile` so a rebuild can't silently drift to a different upstream weight.
+The first build downloads the v50 text contract (~133 MB across model, tokenizer, config, and vocabulary remap), the 60 MB rfdetr_v19 ONNX, and the baked Gemma weights. Subsequent builds use the build cache. Both HuggingFace revisions and every model artifact checksum are pinned, so a rebuild cannot silently drift to different weights.
 
 ## Deploy to Tinfoil
 
-1. **Push the image to a public registry** (GitHub Container Registry):
+1. **Build and push the image to GitHub Container Registry** using the
+   `privacy-filter release` workflow. Supply the semantic version without
+   the `v` prefix (for example `0.8.0`). The workflow prints the immutable
+   image digest.
 
    ```bash
-   VERSION=v0.1.0
-   docker build -t ghcr.io/screenpipe/privacy-filter:$VERSION .
-   docker push ghcr.io/screenpipe/privacy-filter:$VERSION
-
-   # Grab the digest for tinfoil-config.yml (Tinfoil requires pinned digests).
-   docker inspect --format='{{index .RepoDigests 0}}' \
-     ghcr.io/screenpipe/privacy-filter:$VERSION
+   gh workflow run release.yml --ref <branch> -f version=0.8.0
    ```
 
-2. **Pin the digest** in `tinfoil-config.yml` — replace the `REPLACE_WITH_DIGEST`
-   sentinel with the full `sha256:...` from the previous step. Commit and tag:
+2. **Pin the digest** in `tinfoil-config.yml`, commit it, then create the
+   matching `v*` tag. The tag runs the Tinfoil measurement/attestation job.
 
    ```bash
    git add tinfoil-config.yml
-   git commit -m "release: privacy-filter $VERSION"
-   git tag $VERSION && git push origin main --tags
+   git commit -m "release: privacy-filter v0.8.0"
+   git tag v0.8.0 && git push origin <branch> v0.8.0
    ```
 
 3. **Click-through in the Tinfoil dashboard** (https://dash.tinfoil.sh):
@@ -89,42 +86,40 @@ First build pre-downloads the ScreenPipe fine-tuned OPF text model (~3 GB bf16) 
 
 ## Resource sizing (GPU)
 
-**Text model (ScreenPipe fine-tuned OPF v6) — BF16 on CUDA:**
+**Text model (`v50_distilled6l`) — mixed int4/int8 ONNX:**
 
 | Metric | Value |
 |---|---|
-| Weights (BF16) | ~3 GB VRAM |
-| Active params per token | 50 M (MoE top-4 of 128 experts) |
-| Attention window | 257 tokens (banded, O(N)) |
-| H100 latency (512 tokens) | ~50–100 ms |
-| H100 latency (~2 KB OCR row, 600 tok) | ~150–300 ms |
+| Model artifact | 114 MB |
+| Model shape | six-layer XLM-R student |
+| Runtime window | 256 tokens with 64-token overlap |
+| Local CPU reference | 7–9 ms for short captured strings |
 
-**Image model (rfdetr_v8) — TensorRT/CUDA EP:**
+**Image model (`rfdetr_v19`) — TensorRT/CUDA EP:**
 
 | Metric | Value |
 |---|---|
-| Weights (FP32 ONNX) | 108 MB |
+| Weights (FP16, FP32 I/O) | 60 MB |
 | Params | ~25 M |
-| Input resolution | 320×320 |
-| H100 latency (per frame) | ~25–35 ms |
-| Bench accuracy | 95.3% zero-leak / 0% oversmash on screenpipe-pii-bench-image val |
+| Input resolution | 512×512 |
+| Local CPU reference | ~118 ms/frame |
+| Real-app planted-secret gate | 19/19 detected at the production 0.50 floor |
 
-**Combined runtime** (32 GB CVM RAM + 80 GB H100 VRAM): ~5 GB GPU working set, ~30 req/sec short-text or ~30 frames/sec image, more if interleaved.
-
-The CPU-only build (preserved on git history before v0.2.0) was the original deploy target — fits 8 vCPU / 32 GB RAM but at ~10× the latency. Switch back if cost dominates and the worker queue isn't backing up.
+The deployed CVM also carries Gemma E2B and its vLLM working set, so
+`tinfoil-config.yml` remains the source of truth for total CPU, memory, and GPU sizing.
 
 ## Security properties
 
 - **Tinfoil remote attestation** covers the exact image digest, so clients can verify the specific model bits + server code that handled their request.
-- **Only `/health`, `/filter`, and `/image/detect` are exposed** — Tinfoil's `shim.paths` allowlist blocks every other URL at the enclave boundary, so no introspection / debug endpoints can leak.
+- **Only the paths listed in `tinfoil-config.yml` are exposed** — Tinfoil's shim allowlist blocks every other URL at the enclave boundary.
 - **Model weights are baked in.** Text model: build-time HF download then `TRANSFORMERS_OFFLINE=1`. Image model: build-time HF download with SHA-256 verification via Docker's `ADD --checksum=`. No runtime HuggingFace calls, so an attacker who subverts DNS can't swap weights out from under the enclave.
-- **Runs as UID 10001 non-root** inside the container.
+- **The exact container image is measured and attested.** The process currently runs as root because the co-hosted vLLM needs access to NVIDIA device nodes; the Tinfoil shim and CVM remain the external security boundary.
 
 ## Limitations
 
 - **Text:** English-primary. Multilingual coverage per upstream model card varies.
-- **Text:** 128K context upstream; we cap at `MAX_INPUT_TOKENS=8192` (override via env) to keep enclave memory bounded.
-- **Image:** the rfdetr_v8 model was trained on screenpipe-pii-bench-image, which covers Slack / Outlook / Cursor / Terminal / Confluence / GitHub / 1Password / calendars / browsers. Apps with very different UI chrome (e.g. Zoom name overlays on video tiles) are not yet learned — failures should be added back into the bench's synthetic templates rather than fine-tuned on real captures.
+- **Text:** long inputs are split into overlapping 256-token windows; request size is capped separately by `MAX_INPUT_CHARS`.
+- **Image:** v19 is validated on released eval suites and planted real-app secrets, but unusual layouts, scripts, handwriting, occlusion, and adversarial inputs still need their own evaluation.
 - **Image:** payload cap `MAX_IMAGE_BYTES=20 MB` (override via env). Decoded RGB working buffer is ~3× the payload.
 - Not a compliance certification. One layer in a privacy-by-design stack.
 
@@ -132,4 +127,4 @@ The CPU-only build (preserved on git history before v0.2.0) was the original dep
 
 [PolyForm Noncommercial License 1.0.0](./LICENSE.md). You can read, run, fork, modify, and share — **noncommercial use only**. Commercial use requires a separate license; reach out to `louis@screenpi.pe`.
 
-Bundled / downloaded model weights keep their own licenses: `screenpipe/pii-text-redactor` (ScreenPipe fine-tune built on OpenAI Privacy Filter), `openai/privacy-filter` tokenizer/config code (OpenAI's terms), `screenpipe/pii-image-redactor` (`rfdetr_v9`), `google/gemma-4-E4B-it` (Gemma Terms of Use). Using this image commercially means complying with all of them in addition to this repo's license.
+Bundled / downloaded model weights keep their own licenses: `screenpipe/pii-redactor`, `screenpipe/pii-image-redactor` (`rfdetr_v19`), and `google/gemma-4-E2B-it` (Gemma Terms of Use). Using this image commercially means complying with all of them in addition to this repo's license.

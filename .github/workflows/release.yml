@@ -22,7 +22,12 @@ on:
   # Build is decoupled from release tags: dispatch this manually to
   # produce an image, copy the digest into tinfoil-config.yml, then push
   # a `v*` tag which fires tinfoil-build.yml and attests the pinned image.
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version without the v prefix (for example 0.8.0); blank creates a dev timestamp"
+        required: false
+        type: string
 
 jobs:
   build-and-push:
@@ -49,13 +54,16 @@ jobs:
           docker-images: false
           swap-storage: false
 
-      - name: Derive version from tag
+      - name: Validate image version
         id: version
         run: |
-          TAG="${GITHUB_REF##*/}"            # e.g. v0.1.0
-          VERSION="${TAG#v}"  # e.g. 0.1.0
-          if [ "$VERSION" = "$TAG" ]; then   # manual dispatch, no tag
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
             VERSION="dev-$(date -u +%Y%m%d%H%M)"
+          fi
+          if ! [[ "$VERSION" =~ ^(dev-[0-9]{12}|[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?)$ ]]; then
+            echo "invalid image version: $VERSION" >&2
+            exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 

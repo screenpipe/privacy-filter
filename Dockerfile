@@ -12,9 +12,10 @@
 # tweaks) and ships ready-to-run. We don't actually use the 31B weights;
 # the base is just a convenient vLLM distribution.
 #
-# Our FastAPI server, v45_phase4 text model, rfdetr_v12 image model, and the
-# baked-in Gemma 4 E4B weights are installed on top. `entrypoint.sh`
-# starts vLLM (E4B) in the background and uvicorn in the foreground.
+# Our FastAPI server, v50_distilled6l text model, rfdetr_v19 image model, and
+# the baked-in Gemma 4 E2B weights are installed on top. `entrypoint.sh`
+# starts vLLM (E2B weights under the stable `gemma4-e4b` API id) in the
+# background and uvicorn in the foreground.
 #
 # Build the image without a GPU; only `runtime: nvidia` + `gpus: all` at
 # deploy time gives the container access to the H100/H200 device.
@@ -65,20 +66,19 @@ RUN pip install --no-cache-dir \
         pillow==11.0.0 \
         numpy==2.1.3
 
-# Download the ScreenPipe v45_phase4 text PII redactor — INT8 ONNX,
-# ~278 MB on disk (model_quantized.onnx + tokenizer.json + config.json).
-# The enclave runs the FULL (un-pruned) checkpoint for maximum accuracy —
-# the desktop app ships the vocab-pruned v45_phase5 for RAM, but the cloud
-# has no RAM constraint, so we serve the most performing model here.
+# Download the ScreenPipe v50_distilled6l text PII redactor — a six-layer
+# XLM-R student, vocab-pruned and mixed int4/int8 quantized (~133 MB including
+# tokenizer + remap). This is the same released checkpoint the desktop app
+# uses, so local and enclave behavior share one model contract.
 #
 # Build-time download with per-file SHA-256 verification (in
 # build_download.py); the resulting image hash is reproducible across
 # rebuilds and covered by Tinfoil's remote attestation measurement.
 ARG SOURCE_MODEL_ID=screenpipe/pii-redactor
-ARG SOURCE_MODEL_REVISION=main
-ARG SOURCE_MODEL_SUBFOLDER=v45_phase4_onnx
+ARG SOURCE_MODEL_REVISION=5c907008e2a2ad394712496a26819ad28dd44662
+ARG SOURCE_MODEL_SUBFOLDER=v50_distilled6l
 ENV MODEL_DIR=/opt/model \
-    MODEL_ID="screenpipe/pii-redactor:v45_phase4 (int8-onnx)"
+    MODEL_ID="screenpipe/pii-redactor:v50_distilled6l (mixed-int4-int8-onnx)"
 COPY build_download.py /tmp/build_download.py
 RUN useradd --system --no-create-home --uid 10001 appuser \
     && SOURCE_MODEL_ID=$SOURCE_MODEL_ID \
@@ -92,19 +92,18 @@ RUN useradd --system --no-create-home --uid 10001 appuser \
 # Image-PII detector. Same auto-download pattern as before — baked at
 # build time with SHA-256 verification so the resulting image hash is
 # reproducible across rebuilds.
-# rfdetr_v12 = fp16 export of the "realworld" retrain (512×512, ~54 MB) —
-# same weights the desktop app ships as v11 fp32. v9 (384px) over-detected
-# on real screens (97% synthetic -> ~1% real precision); the realworld
-# retrain closed that gap. fp16 halves the download and runs natively on
-# the CUDA EP. Input takes float32 (only the weights are fp16). server.py
-# auto-detects the 512px input size from the ONNX at load — the previous
-# hardcoded 384 broke /image/detect with a static-shape mismatch (v0.7.4).
+# rfdetr_v19 = the released real-app-trained detector (512×512, ~60 MB).
+# It retains fp32 input/output around fp16 weights, so the existing numpy /
+# ONNX Runtime path remains compatible. The desktop and enclave now use the
+# same weights. server.py auto-detects the static input resolution at load.
 ARG IMAGE_MODEL_HF_REPO=screenpipe/pii-image-redactor
-ARG IMAGE_MODEL_HF_FILE=rfdetr_v12.onnx
-ARG IMAGE_MODEL_SHA256=71cd7d976ef769255a8d5b7523ecdd547710cc18f8464e0cc9da64c4e8c1aaba
-ENV IMAGE_MODEL_PATH=/opt/rfdetr_v12.onnx
+ARG IMAGE_MODEL_REVISION=d4bb93370fc3fe3c36007bef22f71bd0e97a0951
+ARG IMAGE_MODEL_HF_FILE=rfdetr_v19.onnx
+ARG IMAGE_MODEL_SHA256=b9177c3ca7531da10366e57a6d74a5d2929da7479db6cc1f89419da194fa227f
+ENV IMAGE_MODEL_PATH=/opt/rfdetr_v19.onnx \
+    IMAGE_MODEL_ID="rfdetr_v19"
 ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
-    https://huggingface.co/${IMAGE_MODEL_HF_REPO}/resolve/main/${IMAGE_MODEL_HF_FILE} \
+    https://huggingface.co/${IMAGE_MODEL_HF_REPO}/resolve/${IMAGE_MODEL_REVISION}/${IMAGE_MODEL_HF_FILE} \
     ${IMAGE_MODEL_PATH}
 RUN chown appuser:appuser ${IMAGE_MODEL_PATH}
 
@@ -149,8 +148,10 @@ RUN pip install --no-cache-dir 'transformers==5.12.1' 'pydantic>=2.12,<3' \
  && python3 -c "import transformers; from transformers import Gemma3Config, Gemma4Config, AutoTokenizer; AutoTokenizer.from_pretrained('/opt/model'); print('dep-fix OK: transformers', transformers.__version__)"
 
 COPY --chown=appuser:appuser server.py /app/server.py
+COPY --chown=appuser:appuser model_smoke.py /app/model_smoke.py
 COPY --chown=appuser:appuser entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+ && python3 /app/model_smoke.py
 
 # Run as root because vLLM's serve subprocess needs to touch NVIDIA
 # device nodes (matching Tinfoil's confidential-gemma4-31b which also

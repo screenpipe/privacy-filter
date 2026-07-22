@@ -6,14 +6,13 @@
 Privacy-filter inference service.
 
 Wraps two models in one container:
-  * screenpipe/pii-redactor:v45_phase3 (text)  → POST /filter
-      xlm-roberta-base fine-tune, INT8 ONNX (~278 MB on disk). Same
-      checkpoint the desktop app downloads on first run — outputs
-      match across local + container surfaces.
-  * rfdetr_v9 (image)                          → POST /image/detect
-      RF-DETR-Nano detector (~28 M params at 384×384), fine-tuned on
-      screenpipe-pii-bench-image. Used by screenpipe-redact's
-      `tinfoil_image` adapter. Same 12-class taxonomy as the bench.
+  * screenpipe/pii-redactor:v50_distilled6l (text) → POST /filter
+      Six-layer XLM-R student, vocab-pruned + mixed int4/int8 ONNX.
+      Same checkpoint and token-id remap the desktop app uses.
+  * rfdetr_v19 (image)                            → POST /image/detect
+      RF-DETR-Nano detector (512×512, fp16 weights with fp32 I/O),
+      trained on real-app plus synthetic screens. Same released weights
+      and 12-class taxonomy the desktop app uses.
 
 Both deploy inside the same Tinfoil confidential-compute container so
 neither pixels nor text leave an attested enclave. Single image hash =
@@ -59,9 +58,17 @@ from transformers import AutoTokenizer
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
-MODEL_ID = os.environ.get("MODEL_ID", "screenpipe/pii-redactor:v45_phase4 (int8-onnx)")
+MODEL_ID = os.environ.get(
+    "MODEL_ID",
+    "screenpipe/pii-redactor:v50_distilled6l (mixed-int4-int8-onnx)",
+)
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
+# The v50 checkpoint was trained/evaluated with 256-token windows. Long
+# inputs are still fully covered via overlapping windows in `_opf_on_batch`.
+TEXT_WINDOW_TOKENS = max(
+    3, min(512, int(os.environ.get("TEXT_WINDOW_TOKENS", "256")))
+)
 # Request coalescing for /filter. The HF `ner` pipeline accepts a list
 # input and pads + runs one CUDA forward pass per batch, so grouping
 # concurrent requests is ~free up to a memory ceiling.
@@ -69,7 +76,7 @@ MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
 #                     one lands. 30 ms taxes single-request p50 by ~30 ms
 #                     in the no-load case (≈8 % of total) and is well
 #                     under typical client perception threshold.
-#   BATCH_MAX_SIZE  — max requests fused into one forward pass. v45_phase3
+#   BATCH_MAX_SIZE  — max requests fused into one forward pass. v50
 #                     is xlm-roberta-base; 16 is a safe ceiling on a
 #                     single H100/H200 even with long inputs.
 BATCH_WINDOW_MS = int(os.environ.get("BATCH_WINDOW_MS", "30"))
@@ -87,15 +94,15 @@ _HOP_BY_HOP_HEADERS = frozenset([
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
 ])
 
-# ── Image-PII detector (rfdetr_v12 "realworld", fp16) ───────────────────
+# ── Image-PII detector (rfdetr_v19, real-app trained, fp16) ───────────
 # Path to the ONNX. Baked in by the Dockerfile from
 # huggingface.co/screenpipe/pii-image-redactor.
-IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v12.onnx")
-IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v12")
+IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v19.onnx")
+IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v19")
 # Reject images larger than this (decoded). Defends against an
 # adversarial 100-MB JPEG of a 50K×50K canvas blowing up enclave RAM.
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", "20000000"))  # 20 MB
-# Input resolution fallback. v9 exported at 384×384, v11 at 512×512 — the
+# Input resolution fallback. v13 exported at 384×384, v19 at 512×512 — the
 # real value is auto-detected from the ONNX input shape at load time so a
 # model swap can't silently mismatch the resize; this only applies if the
 # model ships dynamic spatial axes.
@@ -113,7 +120,7 @@ IMAGE_CLASSES = [
 
 # Map model labels (lower-cased, underscore-delimited) to the short tag
 # we substitute into the redacted output. 13 entries to match
-# v45_phase3's label set (matches the bench's CATEGORIES.md). Unknown
+# v50's label set (matches the bench's CATEGORIES.md). Unknown
 # labels fall through to the capitalized label itself.
 LABEL_TAG = {
     "private_person": "PERSON",
@@ -281,7 +288,12 @@ app = FastAPI(
 _session = None
 _tokenizer = None
 _id2label = None
-# rfdetr_v9 ONNX session — loaded alongside the text model at startup.
+# Dense full-tokenizer-id → pruned-embedding-row lookup for v50. The
+# tokenizer emits ids from the original XLM-R vocabulary while the model's
+# embedding table contains only retained rows. Missing ids map to unk_new.
+_token_id_remap = None
+_token_id_unk = 0
+# rfdetr_v19 ONNX session — loaded alongside the text model at startup.
 _image_session = None
 
 # Dynamic-batching state. Initialized in the startup hook so the queue
@@ -316,14 +328,15 @@ def _load_model() -> None:
     30s+ for a cold start, and (b) race with health-check probes during
     deployment rollouts.
     """
-    global _session, _tokenizer, _id2label
+    global _session, _tokenizer, _id2label, _token_id_remap, _token_id_unk
     import onnxruntime as ort
-    log.info("loading v45_phase3 ONNX from %s", MODEL_DIR)
+    import numpy as np
+
+    log.info("loading v50_distilled6l ONNX from %s", MODEL_DIR)
     t0 = time.time()
 
-    # v45_phase3 is an INT8 ONNX xlm-roberta token classifier
-    # (model_quantized.onnx + tokenizer.json + config.json, flat in
-    # MODEL_DIR). We load it with raw onnxruntime and run a manual BIO
+    # v50 is a mixed-quantized ONNX XLM-R token classifier. We load it
+    # with raw onnxruntime and run a manual BIO
     # decode (see _opf_on_batch) — the SAME approach the desktop app and
     # the bench use. We deliberately do NOT use optimum + the HF `ner`
     # pipeline: (a) optimum's import is brittle across transformers
@@ -333,6 +346,29 @@ def _load_model() -> None:
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     with open(os.path.join(MODEL_DIR, "config.json")) as f:
         _id2label = {int(k): v for k, v in json.load(f)["id2label"].items()}
+
+    # v50's tokenizer is intentionally full-vocab while its embedding table
+    # is pruned. Build a dense lookup once at startup so every batched forward
+    # can remap ids with one numpy gather instead of 100k Python dict lookups.
+    remap_path = os.path.join(MODEL_DIR, "remap.json")
+    with open(remap_path) as f:
+        remap_contract = json.load(f)
+    raw_remap = remap_contract.get("remap")
+    if not isinstance(raw_remap, dict) or "unk_new" not in remap_contract:
+        raise RuntimeError("remap.json must contain a remap object and unk_new")
+    _token_id_unk = int(remap_contract["unk_new"])
+    vocab_size = max(
+        len(_tokenizer), max((int(k) for k in raw_remap), default=-1) + 1
+    )
+    _token_id_remap = np.full(vocab_size, _token_id_unk, dtype=np.int64)
+    for old_id, new_id in raw_remap.items():
+        _token_id_remap[int(old_id)] = int(new_id)
+    log.info(
+        "loaded v50 vocab remap (%d retained ids, %d full-vocab ids, unk=%d)",
+        len(raw_remap),
+        vocab_size,
+        _token_id_unk,
+    )
 
     # CUDA EP for GPU acceleration; CPU EP as a transparent fallback so a
     # missing/mismatched CUDA stack degrades to (correct, slower) CPU
@@ -351,7 +387,7 @@ def _load_model() -> None:
 
 @app.on_event("startup")
 def _load_image_model() -> None:
-    """Load the rfdetr_v8 ONNX session.
+    """Load the rfdetr_v19 ONNX session.
 
     Boot is independent of the text model so they can fail or be
     disabled separately. If `IMAGE_MODEL_PATH` is missing we log and
@@ -373,7 +409,7 @@ def _load_image_model() -> None:
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     # GPU EP order — TensorRT first (compiles the graph for the device,
-    # ~5× faster on rfdetr_v8 once warmed up), then CUDA as a fallback
+    # ~5× faster once warmed up), then CUDA as a fallback
     # while TensorRT engine cache is cold, then CPU as a final safety
     # net so a misconfigured deploy doesn't hard-fail at boot.
     providers = [
@@ -554,6 +590,7 @@ def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
     """
     import numpy as np
     assert _session is not None and _tokenizer is not None and _id2label is not None
+    assert _token_id_remap is not None
     # xlm-roberta-base supports only 512 positions (514 incl. CLS/SEP). A single
     # >512-token sequence makes the model's position-embedding Expand node fail
     # ([ONNXRuntimeError] invalid expand shape -> HTTP 500), and plain truncation
@@ -563,7 +600,7 @@ def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
     # single padded forward (every window <=512 -> safe), then merge spans back
     # per source text by char offset. offset_mapping for an overflow window is
     # relative to its source text; overflow_to_sample_mapping says which text.
-    WIN, STRIDE = 510, 64
+    WIN, STRIDE = TEXT_WINDOW_TOKENS, min(64, TEXT_WINDOW_TOKENS // 4)
     enc = _tokenizer(
         texts,
         return_offsets_mapping=True,
@@ -576,11 +613,21 @@ def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
     )
     sample_of = enc["overflow_to_sample_mapping"].tolist()   # window -> source-text index
     offsets = enc["offset_mapping"]                          # (W, T, 2) char offsets into source text
-    feed = {
-        i.name: enc[i.name].astype(np.int64)
-        for i in _session.get_inputs()
-        if i.name in enc
-    }
+    feed = {}
+    for model_input in _session.get_inputs():
+        if model_input.name not in enc:
+            continue
+        values = enc[model_input.name].astype(np.int64)
+        if model_input.name == "input_ids":
+            # Vectorized full-vocab → pruned-row mapping. Keep an explicit
+            # bounds fallback even though tokenizer ids should always fit the
+            # lookup; malformed/custom tokenizers must fail closed to UNK, not
+            # index outside the table or reach an invalid embedding row.
+            valid = (values >= 0) & (values < len(_token_id_remap))
+            remapped = np.full(values.shape, _token_id_unk, dtype=np.int64)
+            remapped[valid] = _token_id_remap[values[valid]]
+            values = remapped
+        feed[model_input.name] = values
     logits = _session.run(None, feed)[0]                     # (W, T, C)
     shifted = logits - logits.max(axis=-1, keepdims=True)
     probs = np.exp(shifted)
@@ -818,7 +865,7 @@ def image_detect(req: DetectRequest) -> DetectResponse:
     resized = img.resize((IMAGE_INPUT_SIZE, IMAGE_INPUT_SIZE), Image.BILINEAR)
 
     # ImageNet mean/std → NCHW float32. Same pre-processing the
-    # rfdetr_v8 export was traced with; see screenpipe-pii-bench-image
+    # rfdetr_v19 export was traced with; see screenpipe-pii-bench-image
     # /src/adapters/rfdetr_v1.py for the canonical client-side version.
     arr = np.asarray(resized, dtype=np.float32) / 255.0
     arr = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array(
