@@ -82,12 +82,15 @@ TEXT_WINDOW_TOKENS = max(
 BATCH_WINDOW_MS = int(os.environ.get("BATCH_WINDOW_MS", "30"))
 BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", "16"))
 
-# ── Co-hosted Gemma 4 E4B proxy ─────────────────────────────────────────
+# ── Co-hosted model proxies ───────────────────────────────────────────────
 # One vLLM process runs in this same container (started by entrypoint.sh):
 #   gemma4-e4b on 127.0.0.1:8001 — chat + vision + audio.
 # The 31B does NOT run here — it stays on Tinfoil's hosted
 # inference.tinfoil.sh path, reached separately by the gateway.
 GEMMA_UPSTREAM = os.environ.get("GEMMA_UPSTREAM", "http://127.0.0.1:8001")
+# GLM runs as a sibling Tinfoil container on the enclave's private network.
+# Keeping it under /glm/v1/* preserves every existing Gemma and PII route.
+GLM_UPSTREAM = os.environ.get("GLM_UPSTREAM", "http://127.0.0.1:8002")
 # Hop-by-hop headers per RFC 7230 §6.1 — never forward.
 _HOP_BY_HOP_HEADERS = frozenset([
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -305,6 +308,7 @@ _text_batch_task: "asyncio.Task | None" = None
 # so the connection pool is shared across requests (vLLM keepalive helps
 # under concurrent /v1/chat/completions load).
 _gemma_client: "httpx.AsyncClient | None" = None
+_glm_client: "httpx.AsyncClient | None" = None
 
 # Gemma upstream liveness, fed by _probe_gemma() (called from /health and
 # /healthz) and by successful /v1/* proxy round-trips. `_gemma_last_ok =
@@ -318,6 +322,12 @@ _gemma_last_ok: "float | None" = None
 # restarts a crashed vLLM with ≤300 s backoff, so 900 s of continuous
 # downtime means in-container restarts aren't sticking.
 GEMMA_UNHEALTHY_AFTER = float(os.environ.get("GEMMA_UNHEALTHY_AFTER", "900"))
+
+# GLM is observable but deliberately excluded from /healthz. Its own Tinfoil
+# container healthcheck gates blue-green deployment, while the production PII
+# container's recycle policy remains tied only to the existing Gemma contract.
+_glm_started: float = time.time()
+_glm_last_ok: "float | None" = None
 
 
 @app.on_event("startup")
@@ -493,12 +503,31 @@ async def _open_gemma_proxy() -> None:
     log.info("gemma proxy upstream initialized: %s", GEMMA_UPSTREAM)
 
 
+@app.on_event("startup")
+async def _open_glm_proxy() -> None:
+    global _glm_client
+    _glm_client = httpx.AsyncClient(
+        base_url=GLM_UPSTREAM,
+        timeout=httpx.Timeout(None, connect=10.0),
+        limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+    )
+    log.info("glm proxy upstream initialized: %s", GLM_UPSTREAM)
+
+
 @app.on_event("shutdown")
 async def _close_gemma_proxy() -> None:
     global _gemma_client
     if _gemma_client is not None:
         await _gemma_client.aclose()
         _gemma_client = None
+
+
+@app.on_event("shutdown")
+async def _close_glm_proxy() -> None:
+    global _glm_client
+    if _glm_client is not None:
+        await _glm_client.aclose()
+        _glm_client = None
 
 
 @app.on_event("startup")
@@ -692,15 +721,37 @@ async def _probe_gemma() -> bool:
     return False
 
 
+async def _probe_glm() -> bool:
+    """Report GLM liveness without making PII container health depend on it."""
+    global _glm_last_ok
+    if _glm_client is None:
+        return False
+    try:
+        r = await _glm_client.get("/health", timeout=2.0)
+    except httpx.HTTPError:
+        return False
+    if r.status_code == 200:
+        _glm_last_ok = time.time()
+        return True
+    return False
+
+
 def _gemma_down_seconds(ready: bool) -> float:
     if ready:
         return 0.0
     return time.time() - (_gemma_last_ok if _gemma_last_ok is not None else _gemma_started)
 
 
+def _glm_down_seconds(ready: bool) -> float:
+    if ready:
+        return 0.0
+    return time.time() - (_glm_last_ok if _glm_last_ok is not None else _glm_started)
+
+
 @app.get("/health")
 async def health() -> dict:
     gemma_ready = await _probe_gemma()
+    glm_ready = await _probe_glm()
     return {
         "status": "ok",
         "model_ready": _session is not None,
@@ -710,6 +761,9 @@ async def health() -> dict:
         "gemma_ready": gemma_ready,
         "gemma_model": "gemma4-e4b",
         "gemma_down_seconds": round(_gemma_down_seconds(gemma_ready), 1),
+        "glm_ready": glm_ready,
+        "glm_model": "glm-5.3-flash-reap50-iq3m",
+        "glm_down_seconds": round(_glm_down_seconds(glm_ready), 1),
     }
 
 
@@ -1080,6 +1134,67 @@ async def proxy_to_gemma(path: str, request: Request):
     # Any upstream HTTP response (even a 4xx) proves the vLLM process is
     # alive — feed the liveness window used by /health and /healthz.
     _gemma_last_ok = time.time()
+
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in _HOP_BY_HOP_HEADERS
+    }
+
+    async def _stream():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(
+        _stream(),
+        status_code=upstream.status_code,
+        headers=resp_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+# ── GLM-5.3 Flash reverse proxy ─────────────────────────────────────────
+
+
+@app.api_route(
+    "/glm/v1/{path:path}",
+    methods=["GET", "POST", "OPTIONS"],
+    include_in_schema=False,
+)
+async def proxy_to_glm(path: str, request: Request):
+    """Forward /glm/v1/* to the sibling llama.cpp container.
+
+    The prefix keeps the established /v1/* Gemma API stable. Tinfoil handles
+    external authentication; only the enclave-private models network can reach
+    the upstream server directly.
+    """
+    if _glm_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="glm upstream proxy not initialized — startup hook didn't run",
+        )
+
+    fwd_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in _HOP_BY_HOP_HEADERS
+    }
+    body = await request.body()
+    upstream_req = _glm_client.build_request(
+        method=request.method,
+        url=f"/v1/{path}",
+        headers=fwd_headers,
+        content=body,
+        params=request.query_params,
+    )
+    global _glm_last_ok
+    try:
+        upstream = await _glm_client.send(upstream_req, stream=True)
+    except httpx.RequestError as e:
+        log.warning("glm upstream request error for /glm/v1/%s: %s", path, e)
+        raise HTTPException(status_code=502, detail=f"glm upstream unreachable: {e}")
+    _glm_last_ok = time.time()
 
     resp_headers = {
         k: v for k, v in upstream.headers.items()
