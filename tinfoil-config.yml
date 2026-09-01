@@ -7,32 +7,42 @@
 # the image at the pinned digest, runs remote attestation, and exposes the
 # service at https://<name>.<org>.containers.tinfoil.dev.
 #
-# ── v0.5.0: co-host Gemma 4 E4B (audio + vision + chat) ────────────────
-# One image, one Tinfoil container, one shim, two GPU workloads on the
-# H200 (~141 GB VRAM):
+# ── v0.9.0: co-host GLM-5.3-Flash REAP50 ──────────────────────────────
+# One enclave, one shim, two containers, three GPU workloads on the H200
+# (~141 GB VRAM):
 #   1. privacy-filter   (text PII + image PII)                 ~16 GB
 #   2. Gemma 4 E4B vLLM (chat + vision + audio, BF16)          ~21 GB
 #      (16 GB weights + ~5 GB KV at --gpu-memory-utilization 0.25)
+#   3. GLM-5.3-Flash REAP50 IQ3_M llama.cpp                    67.2 GiB
 # The 31B model stays on Tinfoil's hosted inference.tinfoil.sh path,
 # reached via packages/ai-gateway in the Cloudflare worker — it's a
 # different model with different trade-offs, not a replacement for E4B.
 # E4B is the only Gemma 4 variant with native audio understanding.
 #
-# vLLM runs as a sibling process inside the same container started by
-# `entrypoint.sh`; FastAPI proxies /v1/* to it on localhost:8001.
+# vLLM runs as a sibling process inside the privacy-filter container;
+# FastAPI proxies /v1/* to it on localhost:8001. GLM runs in its own
+# container on the enclave-private `models` network and is exposed only
+# through the existing FastAPI router under /glm/v1/*.
 
-cvm-version: 0.7.5
+cvm-version: 0.11.0
 
 # CPU stays at 16 (vLLM scheduler is light). Memory at 131072 (128 GB)
 # because the image includes ~10 GB of baked E2B weights (served under the
 # stable gemma4-e4b API id; E2B isn't on Tinfoil's modelwrap system yet)
-# and needs more ramdisk room
-# during pull. Tinfoil only accepts a fixed set of tiers — 2048, 4096,
-# 8192, 16384, 32768, 65536, 131072, 262144, … — so 96 GB (98304) is
-# rejected as "not a valid tier". 128 GB is the next valid step up.
+# and needs more ramdisk room during pull. Tinfoil only accepts fixed memory
+# tiers, so 128 GB remains selected. The measured GLM package is mounted
+# read-only instead of copied into the container ramdisk.
 cpus: 16
 memory: 131072
 gpus: 1
+
+networks:
+  models: {}
+
+models:
+  - name: "glm-5-3-flash-reap50-iq3m"
+    repo: "patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF@dfe3665e9e006548d97d0b58457628637eef6e0c"
+    mpk: "260fbbbd8ad74cb2ec338e65fd4d3b4afd0cee508c2455886882f2813ca93ad0_433533227008_0809c1e6-6b9b-57eb-b2b8-37bef6f8a5c5"
 
 containers:
   - name: privacy-filter
@@ -40,7 +50,7 @@ containers:
     # Bump flow: dispatch release.yml → copy digest from "Print digest"
     # step → paste here → commit → push a new `v*` tag to trigger
     # tinfoil-build.yml which attests this exact digest.
-    image: "ghcr.io/screenpipe/privacy-filter:0.8.0@sha256:feb09df5a186fa1fb6bbbb5e5aa98c61aada247ca40b9bd7818c2b18f51fb115"
+    image: "ghcr.io/screenpipe/privacy-filter:0.9.0@sha256:b49c5fe212b9bad157f21597d44d5ce9bd1786af52a8ba3bd7979b23118b8ebb"
     runtime: nvidia
     gpus: all
     # ipc:host is required by some CUDA workloads (PyTorch's shared-mem
@@ -52,6 +62,8 @@ containers:
       # vLLM listens on this loopback port; server.py reverse-proxies
       # /v1/* to it. Same container = same network namespace = 127.0.0.1.
       - GEMMA_UPSTREAM: "http://127.0.0.1:8001"
+      - GLM_UPSTREAM: "http://glm-5-3-flash:8002"
+    networks: ["models"]
     restart: "always"
     healthcheck:
       # /healthz (not /health) folds in the gemma-restart policy: 200 while
@@ -74,6 +86,51 @@ containers:
       # /filter is responsive immediately.
       start_period: "600s"
 
+  - name: glm-5-3-flash
+    image: "ghcr.io/screenpipe/privacy-filter:glm-0.9.0@sha256:45482ce7bc219870bede87146a189a0bed5b72a0696304b4c4f2a88c9aa882a3"
+    runtime: nvidia
+    gpus: all
+    ipc: host
+    restart: "always"
+    networks: ["models"]
+    command:
+      - "--model"
+      - "/tinfoil/mpk/mpk-260fbbbd8ad74cb2ec338e65fd4d3b4afd0cee508c2455886882f2813ca93ad0/GLM-5.3-Flash-REAP50-IQ3_M.gguf"
+      - "--alias"
+      - "glm-5.3-flash-reap50-iq3m"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8002"
+      - "--ctx-size"
+      - "32768"
+      - "--n-gpu-layers"
+      - "999"
+      - "--parallel"
+      - "1"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--cache-ram"
+      - "512"
+      - "--jinja"
+      - "--override-kv"
+      - "tokenizer.ggml.eot_token_id=int:154827"
+      - "--override-kv"
+      - "tokenizer.ggml.eom_token_id=int:154829"
+    tmpfs:
+      /tmp: size=2g,mode=1777,exec
+      /root: size=2g,mode=0700,exec
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8002/health"]
+      interval: "30s"
+      timeout: "10s"
+      retries: 10
+      start_period: "3600s"
+
 shim:
   upstream-port: 8080
   # /v1/chat/completions and /v1/responses go through Tinfoil's
@@ -84,6 +141,8 @@ shim:
   authenticated-endpoints:
     - /v1/chat/completions
     - /v1/responses
+    - /glm/v1/chat/completions
+    - /glm/v1/completions
   # Any path not listed is rejected with 404 at the shim — no debug or
   # introspection leaks. /v1/* surface is for Gemma E4B chat / audio /
   # vision; everything else mirrors v0.3.x.
@@ -94,4 +153,7 @@ shim:
     - /v1/chat/completions
     - /v1/models
     - /v1/responses
+    - /glm/v1/chat/completions
+    - /glm/v1/completions
+    - /glm/v1/models
     - /metrics
