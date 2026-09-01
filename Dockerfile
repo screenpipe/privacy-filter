@@ -63,7 +63,7 @@ RUN pip install --no-cache-dir \
         tokenizers==0.20.3 \
         accelerate==1.1.1 \
         safetensors==0.4.5 \
-        onnxruntime-gpu==1.20.1 \
+        onnxruntime-gpu==1.20.2 \
         pillow==11.0.0 \
         numpy==2.1.3
 
