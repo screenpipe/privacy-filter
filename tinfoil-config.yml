@@ -73,19 +73,17 @@ containers:
       /home/appuser: size=8g,mode=0700,uid=10001,gid=999,exec
     restart: "always"
     healthcheck:
-      # Candidate gate: require both PII ONNX sessions to initialize a GPU
-      # provider. The public endpoints still retain CPU fallback for live
-      # availability, but a blue-green candidate must not promote silently
-      # degraded. Gemma's separate /healthz watchdog policy is unchanged.
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/gpu-healthz', timeout=3)"]
+      # Candidate gate: require both PII ONNX sessions on GPU plus Gemma and
+      # GLM ready before blue-green promotion. The public PII endpoints retain
+      # CPU fallback for live availability, while an already-running Gemma
+      # still uses the separate /healthz watchdog/restart policy below.
+      test: ["CMD", "python3", "-c", "import json, urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)); assert d['pii_gpu_ready'] and d['gemma_ready'] and d['glm_ready'], d"]
       interval: "15s"
       timeout: "5s"
       retries: 10
-      # 10 min grace — E2B BF16 weight load from the image to VRAM is
-      # ~30 s plus a few seconds of CUDA graph compile. The privacy
-      # filter GPU health endpoint comes up first while E2B
-      # is still loading (the 900 s downtime grace covers boot), so
-      # /filter is responsive immediately.
+      # 10 min grace covers the image/model mount, E2B BF16 weight load,
+      # CUDA graph compile, and GLM startup. Once the grace expires, every
+      # served workload must be ready before Tinfoil can promote the candidate.
       start_period: "600s"
 
   - name: glm-5-3-flash
