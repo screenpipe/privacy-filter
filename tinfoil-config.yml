@@ -53,19 +53,24 @@ containers:
     image: "ghcr.io/screenpipe/privacy-filter:0.9.0@sha256:b49c5fe212b9bad157f21597d44d5ce9bd1786af52a8ba3bd7979b23118b8ebb"
     runtime: nvidia
     gpus: all
+    # The RF-DETR artifact is intentionally owner-readable (0600) by the
+    # image's appuser. CVM 0.11 drops root's DAC_OVERRIDE capability, so run
+    # as that owner instead of weakening the hardened capability set.
+    user: "10001:999"
     env:
       - PORT: "8080"
+      - HOME: "/home/appuser"
       # vLLM listens on this loopback port; server.py reverse-proxies
       # /v1/* to it. Same container = same network namespace = 127.0.0.1.
       - GEMMA_UPSTREAM: "http://127.0.0.1:8001"
       - GLM_UPSTREAM: "http://glm-5-3-flash:8002"
     networks: ["models"]
     # CVM 0.11 hardens container roots as read-only. Python/torch require a
-    # writable temporary directory, and vLLM may compile/cache under /root.
+    # writable temporary directory, and vLLM compiles under the user's home.
     # Keep both writable surfaces bounded and in-memory.
     tmpfs:
       /tmp: size=8g,mode=1777,exec
-      /root: size=8g,mode=0700,exec
+      /home/appuser: size=8g,mode=0700,uid=10001,gid=999,exec
     restart: "always"
     healthcheck:
       # /healthz (not /health) folds in the gemma-restart policy: 200 while
