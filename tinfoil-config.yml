@@ -53,10 +53,6 @@ containers:
     image: "ghcr.io/screenpipe/privacy-filter:0.9.0@sha256:b49c5fe212b9bad157f21597d44d5ce9bd1786af52a8ba3bd7979b23118b8ebb"
     runtime: nvidia
     gpus: all
-    # ipc:host is required by some CUDA workloads (PyTorch's shared-mem
-    # tensor pool, NCCL collectives) — match Tinfoil's other GPU
-    # containers (e.g. their confidential-gemma4-31b) for consistency.
-    ipc: host
     env:
       - PORT: "8080"
       # vLLM listens on this loopback port; server.py reverse-proxies
@@ -90,7 +86,6 @@ containers:
     image: "ghcr.io/screenpipe/privacy-filter:glm-0.9.0@sha256:45482ce7bc219870bede87146a189a0bed5b72a0696304b4c4f2a88c9aa882a3"
     runtime: nvidia
     gpus: all
-    ipc: host
     restart: "always"
     networks: ["models"]
     command:
