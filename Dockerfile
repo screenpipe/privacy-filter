@@ -38,11 +38,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 # Two-phase install:
-#   1) FastAPI / pydantic / httpx / huggingface_hub — safe to let pip
-#      resolve.
+#   1) FastAPI / pydantic / httpx / huggingface_hub / ONNX Runtime — safe
+#      to let pip resolve. ONNX Runtime does not depend on torch, and keeping
+#      its small runtime dependencies (notably flatbuffers) is required.
+#      The pinned base currently ships torch 2.11 + CUDA 13; ORT 1.29 is
+#      the stable CUDA 13/cuDNN 9 wheel. ORT 1.20 targeted CUDA 12 and
+#      silently fell back to CPU while looking for libcublasLt.so.12.
 #   2) transformers (tokenizer only) / tokenizers / accelerate /
-#      safetensors / onnxruntime-gpu / pillow / numpy — torch-adjacent,
-#      install with --no-deps so torch stays at the version the base ships.
+#      safetensors / pillow / numpy — torch-adjacent, install with --no-deps
+#      so torch stays at the version the base ships.
 #      transformers is pinned to 4.46.x: it's used ONLY for AutoTokenizer
 #      (the model runs via raw onnxruntime, not optimum), and 4.46.x is the
 #      last line compatible with the base's huggingface_hub 0.26.2. (5.6.0
@@ -58,12 +62,12 @@ RUN pip install --no-cache-dir \
         pydantic==2.9.2 \
         httpx==0.27.2 \
         huggingface_hub==0.26.2 \
+        onnxruntime-gpu==1.29.0 \
  && pip install --no-cache-dir --no-deps \
         transformers==4.46.3 \
         tokenizers==0.20.3 \
         accelerate==1.1.1 \
         safetensors==0.4.5 \
-        onnxruntime-gpu==1.20.2 \
         pillow==11.0.0 \
         numpy==2.1.3
 
@@ -156,10 +160,9 @@ RUN chmod +x /entrypoint.sh \
  && python3 /app/model_smoke.py \
  && python3 /app/proxy_smoke.py
 
-# Run as root because vLLM's serve subprocess needs to touch NVIDIA
-# device nodes (matching Tinfoil's confidential-gemma4-31b which also
-# runs as root). The Tinfoil shim handles external auth so app-level
-# privilege drops don't add a meaningful security boundary here.
+# Keep the upstream image default for standalone Docker use. Production's
+# tinfoil-config.yml overrides this with the artifact-owning appuser
+# (10001:999), which has access to Tinfoil's injected NVIDIA device.
 USER root
 
 EXPOSE 8080

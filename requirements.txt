@@ -1,8 +1,8 @@
 fastapi==0.115.4
 uvicorn[standard]==0.32.0
 pydantic==2.9.2
-# CUDA-enabled torch wheels from PyPI — bundled with CUDA 12.4 runtime,
-# matching the nvidia/cuda:12.4.1-cudnn-runtime base image.
+# Kept for standalone/local installs. The Tinfoil image inherits its CUDA and
+# torch stack from the pinned confidential-vLLM base in Dockerfile.
 torch==2.5.1
 # transformers is used ONLY for AutoTokenizer — the text redactor runs
 # the INT8 ONNX directly via onnxruntime (raw session + manual BIO decode,
@@ -13,9 +13,10 @@ transformers==4.46.3
 tokenizers==0.20.3
 accelerate==1.1.1
 safetensors==0.4.5
-# rfdetr_v19 image-PII detector. GPU EP via CUDA + TensorRT (the gpu
-# wheel includes CPUExecutionProvider as a final fallback).
-onnxruntime-gpu==1.20.2
+# Text + rfdetr_v19 image-PII inference. The pinned Tinfoil/vLLM base is CUDA 13;
+# ONNX Runtime 1.20.x wheels target CUDA 12 and silently fell back to CPU.
+# 1.29.x is the stable CUDA 13 + cuDNN 9 wheel line.
+onnxruntime-gpu==1.29.0
 pillow==11.0.0
 # numpy is pulled in transitively by torch but pin it explicitly so a
 # torch minor bump can't drift the version we test against.

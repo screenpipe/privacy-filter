@@ -42,10 +42,25 @@ class FakeClient:
         return FakeResponse()
 
 
+class FakeSession:
+    def __init__(self, providers):
+        self.providers = providers
+
+    def get_providers(self):
+        return self.providers
+
+
 async def main():
     fake = FakeClient()
     server._glm_client = fake
     server._gemma_client = FakeClient()
+    server._session = FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
+    server._image_session = FakeSession(
+        [
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+    )
 
     body = json.dumps({"model": "glm-5.3-flash", "messages": []}).encode()
     sent = False
@@ -78,7 +93,20 @@ async def main():
     assert health["status"] == "ok"
     assert health["glm_ready"] is True
     assert health["glm_model"] == "glm-5.3-flash-reap50-iq3m"
-    print("proxy smoke OK: isolated /glm/v1 route + health telemetry")
+    assert health["pii_gpu_ready"] is True
+    assert health["text_provider"] == "CUDAExecutionProvider"
+    assert health["image_provider"] == "CUDAExecutionProvider"
+    assert server.gpu_healthz()["status"] == "ok"
+
+    server._image_session = FakeSession(["CPUExecutionProvider"])
+    try:
+        server.gpu_healthz()
+    except server.HTTPException as exc:
+        assert exc.status_code == 503
+    else:
+        raise AssertionError("GPU deployment gate accepted a CPU-only image session")
+
+    print("proxy smoke OK: isolated /glm/v1 route + GPU deployment gate")
 
 
 if __name__ == "__main__":

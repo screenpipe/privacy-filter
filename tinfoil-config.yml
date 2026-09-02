@@ -73,22 +73,17 @@ containers:
       /home/appuser: size=8g,mode=0700,uid=10001,gid=999,exec
     restart: "always"
     healthcheck:
-      # /healthz (not /health) folds in the gemma-restart policy: 200 while
-      # gemma is up or while entrypoint.sh's supervisor is restarting a
-      # crashed vLLM; 503 once gemma has been continuously down past
-      # GEMMA_UNHEALTHY_AFTER (default 900 s) — i.e. restarts aren't sticking.
-      # This marks the container unhealthy for observability, but the actual
-      # recycle is driven by entrypoint.sh's watchdog (v0.7.7), which exits
-      # PID 1 on a sustained 503 so `restart: always` fires — `restart:
-      # always` does NOT recycle on an unhealthy healthcheck alone, only on
-      # container exit. urlopen raises on the 503, failing the check.
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      # Candidate gate: require both PII ONNX sessions to initialize a GPU
+      # provider. The public endpoints still retain CPU fallback for live
+      # availability, but a blue-green candidate must not promote silently
+      # degraded. Gemma's separate /healthz watchdog policy is unchanged.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/gpu-healthz', timeout=3)"]
       interval: "15s"
       timeout: "5s"
       retries: 10
-      # 10 min grace — E4B BF16 weight load from the image to VRAM is
+      # 10 min grace — E2B BF16 weight load from the image to VRAM is
       # ~30 s plus a few seconds of CUDA graph compile. The privacy
-      # filter /healthz endpoint comes up first and stays 200 while E4B
+      # filter GPU health endpoint comes up first while E2B
       # is still loading (the 900 s downtime grace covers boot), so
       # /filter is responsive immediately.
       start_period: "600s"

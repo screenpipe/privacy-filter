@@ -30,10 +30,8 @@ Endpoints:
 
 Design choices:
     - Both models loaded once at process start.
-    - GPU inference (H100 / H200): text model runs through ONNX Runtime's
-      CUDAExecutionProvider (INT8 quantized, sub-ms per token); image
-      model runs through ORT's TensorRT EP (CUDA fallback, CPU as a
-      final safety net).
+    - GPU inference (H100 / H200): both models run through ONNX Runtime's
+      CUDAExecutionProvider, with CPU as a final availability fallback.
     - Replaced PII is tagged as [LABEL] (text) or returned as bbox+
       label (image). The downstream client decides how to render.
     - Memory ceiling enforced via MAX_INPUT_TOKENS / MAX_IMAGE_BYTES
@@ -330,6 +328,33 @@ _glm_started: float = time.time()
 _glm_last_ok: "float | None" = None
 
 
+def _session_providers(session) -> list[str]:
+    """Return active ORT providers without making health reporting fragile."""
+    if session is None:
+        return []
+    try:
+        return list(session.get_providers())
+    except Exception:  # noqa: BLE001 — health must survive provider introspection
+        return []
+
+
+def _pii_gpu_state() -> dict:
+    """Report whether both PII sessions initialized a real GPU provider."""
+    text_providers = _session_providers(_session)
+    image_providers = _session_providers(_image_session)
+    text_gpu_ready = "CUDAExecutionProvider" in text_providers
+    image_gpu_ready = "CUDAExecutionProvider" in image_providers
+    return {
+        "text_provider": text_providers[0] if text_providers else None,
+        "text_providers": text_providers,
+        "text_gpu_ready": text_gpu_ready,
+        "image_provider": image_providers[0] if image_providers else None,
+        "image_providers": image_providers,
+        "image_gpu_ready": image_gpu_ready,
+        "pii_gpu_ready": text_gpu_ready and image_gpu_ready,
+    }
+
+
 @app.on_event("startup")
 def _load_model() -> None:
     """Pre-load the model synchronously so /health reports ready state accurately.
@@ -418,12 +443,10 @@ def _load_image_model() -> None:
 
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    # GPU EP order — TensorRT first (compiles the graph for the device,
-    # ~5× faster once warmed up), then CUDA as a fallback
-    # while TensorRT engine cache is cold, then CPU as a final safety
-    # net so a misconfigured deploy doesn't hard-fail at boot.
+    # CUDA first, then CPU as a final availability fallback. The pinned
+    # vLLM base does not ship TensorRT libraries, so requesting TensorRT here
+    # only produces a loader error before ONNX Runtime retries with CUDA.
     providers = [
-        "TensorrtExecutionProvider",
         "CUDAExecutionProvider",
         "CPUExecutionProvider",
     ]
@@ -452,17 +475,13 @@ def _load_image_model() -> None:
     )
     if active == "CPUExecutionProvider":
         log.warning(
-            "image model is running on CPU — neither TensorRT nor CUDA "
-            "providers initialized. Inference will work but at ~5× the "
+            "image model is running on CPU — the CUDA provider did not "
+            "initialize. Inference will work but with higher "
             "latency. Check the onnxruntime-gpu wheel + GPU driver."
         )
 
-    # TensorRT engine build on first inference takes ~50 s for a 384×384
-    # input — paying it during startup keeps it inside the container's
-    # start_period grace window instead of the first user request. Live
-    # bench against v0.3.1 measured first /image/detect at 56 s, then
-    # ~10 ms steady-state. Without warmup that ~50 s tax lands on every
-    # cold-route deploy or restart.
+    # Pay CUDA allocator/kernel initialization during startup so the first
+    # real image request does not absorb the cold-path latency.
     import numpy as np
 
     warm_t0 = time.time()
@@ -472,7 +491,7 @@ def _load_image_model() -> None:
     try:
         _image_session.run(None, {_image_session.get_inputs()[0].name: dummy})
         log.info(
-            "image model warmup completed in %.1fs (TRT engine cached)",
+            "image model CUDA warmup completed in %.1fs",
             time.time() - warm_t0,
         )
     except Exception as e:
@@ -758,6 +777,7 @@ async def health() -> dict:
         "model": MODEL_ID,
         "image_model_ready": _image_session is not None,
         "image_model": IMAGE_MODEL_ID,
+        **_pii_gpu_state(),
         "gemma_ready": gemma_ready,
         "gemma_model": "gemma4-e4b",
         "gemma_down_seconds": round(_gemma_down_seconds(gemma_ready), 1),
@@ -765,6 +785,29 @@ async def health() -> dict:
         "glm_model": "glm-5.3-flash-reap50-iq3m",
         "glm_down_seconds": round(_glm_down_seconds(glm_ready), 1),
     }
+
+
+@app.get("/gpu-healthz", include_in_schema=False)
+def gpu_healthz() -> dict:
+    """Deployment gate: do not promote a candidate whose PII models fell to CPU.
+
+    The public PII endpoints retain their CPU fallback so an already-running
+    instance can keep redacting during a GPU/runtime fault. Tinfoil points the
+    candidate healthcheck here, which makes a CUDA regression fail closed at
+    the blue-green promotion boundary without turning a live PII outage into
+    the fallback behavior.
+    """
+    state = _pii_gpu_state()
+    if not state["pii_gpu_ready"]:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "PII GPU providers unavailable "
+                f"(text={state['text_providers']}, "
+                f"image={state['image_providers']})"
+            ),
+        )
+    return {"status": "ok", **state}
 
 
 @app.get("/healthz", include_in_schema=False)

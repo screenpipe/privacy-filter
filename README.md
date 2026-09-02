@@ -14,7 +14,8 @@ All four workloads deploy inside the same [Tinfoil](https://tinfoil.sh) confiden
 ## API
 
 ```
-GET  /health         → {"status": "ok", "model_ready": true, "image_model_ready": true, ...}
+GET  /health         → {"status": "ok", "model_ready": true, "image_model_ready": true,
+                           "pii_gpu_ready": true, "text_provider": "CUDAExecutionProvider", ...}
 
 POST /filter         → {"text": "My email is alice@foo.com"}
                     ←  {"redacted": "My email is [EMAIL]",
@@ -102,7 +103,7 @@ The first build downloads the v50 text contract (~133 MB across model, tokenizer
 | Runtime window | 256 tokens with 64-token overlap |
 | Local CPU reference | 7–9 ms for short captured strings |
 
-**Image model (`rfdetr_v19`) — TensorRT/CUDA EP:**
+**Image model (`rfdetr_v19`) — CUDA EP:**
 
 | Metric | Value |
 |---|---|
@@ -131,7 +132,7 @@ The model and runtime are pinned by exact commits. Tinfoil mounts the measured m
 - **Tinfoil remote attestation** covers the exact image digest, so clients can verify the specific model bits + server code that handled their request.
 - **Only the paths listed in `tinfoil-config.yml` are exposed** — Tinfoil's shim allowlist blocks every other URL at the enclave boundary.
 - **Model weights are immutable.** The text, image, and Gemma artifacts are baked into the router image. GLM is a measured Tinfoil model package mounted read-only. No workload downloads weights at runtime.
-- **The exact container image is measured and attested.** The process currently runs as root because the co-hosted vLLM needs access to NVIDIA device nodes; the Tinfoil shim and CVM remain the external security boundary.
+- **The exact container image is measured and attested.** Tinfoil runs the router and co-hosted vLLM as the artifact-owning `appuser` (`10001:999`) with access to the injected NVIDIA device; the shim and CVM remain the external security boundary.
 
 ## Limitations
 
