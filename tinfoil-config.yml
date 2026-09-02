@@ -50,7 +50,7 @@ containers:
     # Bump flow: dispatch release.yml → copy digest from "Print digest"
     # step → paste here → commit → push a new `v*` tag to trigger
     # tinfoil-build.yml which attests this exact digest.
-    image: "ghcr.io/screenpipe/privacy-filter:0.9.0@sha256:b49c5fe212b9bad157f21597d44d5ce9bd1786af52a8ba3bd7979b23118b8ebb"
+    image: "ghcr.io/screenpipe/privacy-filter:0.9.4@sha256:4be4eedf0c1ac62eba04e0888dee9b0cdc8fbca4bb4a9be2a550777fa6db70bd"
     runtime: nvidia
     gpus: all
     # The RF-DETR artifact is intentionally owner-readable (0600) by the
