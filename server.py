@@ -41,6 +41,7 @@ Design choices:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -89,6 +90,10 @@ GEMMA_UPSTREAM = os.environ.get("GEMMA_UPSTREAM", "http://127.0.0.1:8001")
 # GLM runs as a sibling Tinfoil container on the enclave's private network.
 # Keeping it under /glm/v1/* preserves every existing Gemma and PII route.
 GLM_UPSTREAM = os.environ.get("GLM_UPSTREAM", "http://127.0.0.1:8002")
+# Custom Tinfoil containers do not share the managed Private Inference key
+# service. Protect the public GLM proxy with an application-owned bearer token
+# injected from Tinfoil's encrypted secret store instead.
+GLM_API_KEY = os.environ.get("GLM_API_KEY", "").strip()
 # Hop-by-hop headers per RFC 7230 §6.1 — never forward.
 _HOP_BY_HOP_HEADERS = frozenset([
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -1209,10 +1214,24 @@ async def proxy_to_gemma(path: str, request: Request):
 async def proxy_to_glm(path: str, request: Request):
     """Forward /glm/v1/* to the sibling llama.cpp container.
 
-    The prefix keeps the established /v1/* Gemma API stable. Tinfoil handles
-    external authentication; only the enclave-private models network can reach
-    the upstream server directly.
+    The prefix keeps the established /v1/* Gemma API stable. This public route
+    uses an application-owned bearer token; only the enclave-private models
+    network can reach the upstream server directly.
     """
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, supplied_key = authorization.partition(" ")
+    if (
+        not GLM_API_KEY
+        or separator != " "
+        or scheme.lower() != "bearer"
+        or not hmac.compare_digest(supplied_key, GLM_API_KEY)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     if _glm_client is None:
         raise HTTPException(
             status_code=503,
@@ -1221,7 +1240,7 @@ async def proxy_to_glm(path: str, request: Request):
 
     fwd_headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in _HOP_BY_HOP_HEADERS
+        if k.lower() not in _HOP_BY_HOP_HEADERS and k.lower() != "authorization"
     }
     body = await request.body()
     upstream_req = _glm_client.build_request(

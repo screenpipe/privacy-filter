@@ -64,6 +64,10 @@ containers:
       # /v1/* to it. Same container = same network namespace = 127.0.0.1.
       - GEMMA_UPSTREAM: "http://127.0.0.1:8001"
       - GLM_UPSTREAM: "http://glm-5-3-flash:8002"
+    secrets:
+      # Application-owned auth for the public GLM proxy. Custom Containers do
+      # not use Tinfoil's managed Private Inference subscription/key service.
+      - GLM_API_KEY
     networks: ["models"]
     # CVM 0.11 hardens container roots as read-only. Python/torch require a
     # writable temporary directory, and vLLM compiles under the user's home.
@@ -132,16 +136,15 @@ containers:
 
 shim:
   upstream-port: 8080
-  # /v1/chat/completions and /v1/responses go through Tinfoil's
-  # control-plane API-key check. /filter, /image/detect, /health stay
-  # un-authenticated for the existing screenpipe-redact clients — same
-  # posture as v0.3.x to avoid breaking them on this rollout.
+  # Gemma's /v1 endpoints retain the existing Tinfoil control-plane key check.
+  # GLM uses GLM_API_KEY inside the privacy-filter router because custom
+  # Containers are unrelated to Tinfoil's managed inference subscription.
+  # /filter, /image/detect, and /health stay unauthenticated for the existing
+  # screenpipe-redact clients — same posture as v0.3.x.
   authenticated: true
   authenticated-endpoints:
     - /v1/chat/completions
     - /v1/responses
-    - /glm/v1/chat/completions
-    - /glm/v1/completions
   # Any path not listed is rejected with 404 at the shim — no debug or
   # introspection leaks. /v1/* surface is for Gemma E4B chat / audio /
   # vision; everything else mirrors v0.3.x.

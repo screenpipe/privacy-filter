@@ -53,6 +53,7 @@ class FakeSession:
 async def main():
     fake = FakeClient()
     server._glm_client = fake
+    server.GLM_API_KEY = "test-glm-secret"
     server._gemma_client = FakeClient()
     server._session = FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
     server._image_session = FakeSession(
@@ -72,13 +73,34 @@ async def main():
         sent = True
         return {"type": "http.request", "body": body, "more_body": False}
 
+    unauthorized_request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/glm/v1/chat/completions",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+        },
+        receive,
+    )
+    try:
+        await server.proxy_to_glm("chat/completions", unauthorized_request)
+    except server.HTTPException as exc:
+        assert exc.status_code == 401
+    else:
+        raise AssertionError("GLM proxy accepted a request without its bearer key")
+
     request = Request(
         {
             "type": "http",
             "method": "POST",
             "path": "/glm/v1/chat/completions",
             "query_string": b"stream=true",
-            "headers": [(b"content-type", b"application/json"), (b"host", b"example")],
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"host", b"example"),
+                (b"authorization", b"Bearer test-glm-secret"),
+            ],
         },
         receive,
     )
@@ -86,6 +108,7 @@ async def main():
     assert fake.request["url"] == "/v1/chat/completions"
     assert fake.request["content"] == body
     assert "host" not in fake.request["headers"]
+    assert "authorization" not in fake.request["headers"]
     assert response.status_code == 200
     assert b"".join([chunk async for chunk in response.body_iterator]) == b'{"ok":true}'
 
@@ -106,7 +129,7 @@ async def main():
     else:
         raise AssertionError("GPU deployment gate accepted a CPU-only image session")
 
-    print("proxy smoke OK: isolated /glm/v1 route + GPU deployment gate")
+    print("proxy smoke OK: authenticated /glm/v1 route + GPU deployment gate")
 
 
 if __name__ == "__main__":
