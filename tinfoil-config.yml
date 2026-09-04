@@ -127,17 +127,19 @@ containers:
       - "q8_0"
       - "--cache-ram"
       - "512"
-      # GLM's summaries and tool payloads repeat long spans. ngram-mod drafts
+      # GLM's summaries and tool payloads repeat short spans. ngram-mod drafts
       # those repetitions without loading a second model; the target still
-      # verifies every accepted token. Keep the MoE-oriented long draft sizes.
+      # verifies every accepted token. A 16-token match avoids the poor-quality
+      # range warned about by llama.cpp while 4–32 token drafts cover brief
+      # filenames, UI labels, and tool-result fragments.
       - "--spec-type"
       - "ngram-mod"
       - "--spec-ngram-size-n"
-      - "24"
+      - "16"
       - "--draft-min"
-      - "48"
+      - "4"
       - "--draft-max"
-      - "64"
+      - "32"
       # Export aggregate timing/slot counters on the enclave-private server so
       # staged benchmarks can separate queue, prefill, and decode latency.
       - "--metrics"

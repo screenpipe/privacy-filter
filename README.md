@@ -126,7 +126,7 @@ The deployed CVM also carries Gemma E2B and its vLLM working set, so
 | Runtime context | 32,768 tokens, one parallel slot |
 | GPU offload | all layers on the H200 |
 | Prefill batches | 4,096 logical / 1,024 physical tokens |
-| Decode acceleration | `ngram-mod` self-speculation (24-token match, 48–64-token drafts) |
+| Decode acceleration | `ngram-mod` self-speculation (16-token match, 4–32-token drafts) |
 
 The model and runtime are pinned by exact commits. Tinfoil mounts the measured model package read-only; the model is not downloaded at runtime.
 
