@@ -9,10 +9,12 @@ Wraps two models in one container:
   * screenpipe/pii-redactor:v50_distilled6l (text) → POST /filter
       Six-layer XLM-R student, vocab-pruned + mixed int4/int8 ONNX.
       Same checkpoint and token-id remap the desktop app uses.
-  * rfdetr_v19 (image)                            → POST /image/detect
+  * rfdetr_v38 (image)                            → POST /image/detect
       RF-DETR-Nano detector (512×512, fp16 weights with fp32 I/O),
-      trained on real-app plus synthetic screens. Same released weights
-      and 12-class taxonomy the desktop app uses.
+      trained on real-app plus synthetic screens. Large desktop frames run
+      as one whole-frame pass plus four overlapping tiles so small rendered
+      PII stays near the scale used during training. Same released weights,
+      tiling policy, and 12-class taxonomy the desktop app uses.
 
 Both deploy inside the same Tinfoil confidential-compute container so
 neither pixels nor text leave an attested enclave. Single image hash =
@@ -100,20 +102,28 @@ _HOP_BY_HOP_HEADERS = frozenset([
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
 ])
 
-# ── Image-PII detector (rfdetr_v19, real-app trained, fp16) ───────────
+# ── Image-PII detector (rfdetr_v38, real-screen validated, fp16) ───────
 # Path to the ONNX. Baked in by the Dockerfile from
 # huggingface.co/screenpipe/pii-image-redactor.
-IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v19.onnx")
-IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v19")
+IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v38.onnx")
+IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v38")
 # Reject images larger than this (decoded). Defends against an
 # adversarial 100-MB JPEG of a 50K×50K canvas blowing up enclave RAM.
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", "20000000"))  # 20 MB
-# Input resolution fallback. v13 exported at 384×384, v19 at 512×512 — the
+# Input resolution fallback. v13 exported at 384×384, v38 at 512×512 — the
 # real value is auto-detected from the ONNX input shape at load time so a
 # model swap can't silently mismatch the resize; this only applies if the
 # model ships dynamic spatial axes.
 IMAGE_INPUT_SIZE = int(os.environ.get("IMAGE_INPUT_SIZE", "512"))
 IMAGE_NUM_QUERIES = 300
+# Whole-frame-only inference shrinks 14 px desktop text below the model's
+# trained scale. The desktop adapter's measured policy unions the whole frame
+# with four overlapping tiles on large images, then suppresses duplicates.
+# Keep an env escape hatch for incident response and controlled A/B checks.
+IMAGE_TILED_INFERENCE = os.environ.get("IMAGE_TILED_INFERENCE", "true").lower() not in {
+    "0", "false", "no", "off",
+}
+IMAGE_TILE_NMS_IOU = 0.55
 # Same 12-class taxonomy as screenpipe-pii-bench-image / src/score.py.
 # Order MUST match the model's class-id ordering (see
 # screenpipe-pii-bench-image/src/adapters/rfdetr_v1.py).
@@ -299,7 +309,7 @@ _id2label = None
 # embedding table contains only retained rows. Missing ids map to unk_new.
 _token_id_remap = None
 _token_id_unk = 0
-# rfdetr_v19 ONNX session — loaded alongside the text model at startup.
+# rfdetr_v38 ONNX session — loaded alongside the text model at startup.
 _image_session = None
 
 # Dynamic-batching state. Initialized in the startup hook so the queue
@@ -427,7 +437,7 @@ def _load_model() -> None:
 
 @app.on_event("startup")
 def _load_image_model() -> None:
-    """Load the rfdetr_v19 ONNX session.
+    """Load the rfdetr_v38 ONNX session.
 
     Boot is independent of the text model so they can fail or be
     disabled separately. If `IMAGE_MODEL_PATH` is missing we log and
@@ -963,61 +973,21 @@ def image_detect(req: DetectRequest) -> DetectResponse:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"could not decode image: {e}")
 
+    # Per-field allow-list (canonical SpanLabel names). None = return all.
+    allowed = _resolve_allowed_labels(req.labels)
     orig_w, orig_h = img.size
-    resized = img.resize((IMAGE_INPUT_SIZE, IMAGE_INPUT_SIZE), Image.BILINEAR)
-
-    # ImageNet mean/std → NCHW float32. Same pre-processing the
-    # rfdetr_v19 export was traced with; see screenpipe-pii-bench-image
-    # /src/adapters/rfdetr_v1.py for the canonical client-side version.
-    arr = np.asarray(resized, dtype=np.float32) / 255.0
-    arr = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array(
-        [0.229, 0.224, 0.225], dtype=np.float32
-    )
-    arr = arr.transpose(2, 0, 1)[None].astype(np.float32)
-
     t0 = time.time()
+    detections: List[ImageDetection] = []
     try:
-        boxes, logits = _image_session.run(
-            None, {_image_session.get_inputs()[0].name: arr}
-        )
+        for window in _image_inference_windows(orig_w, orig_h):
+            detections.extend(
+                _infer_image_window(img, window, req.threshold, allowed, np, Image)
+            )
     except Exception as e:
         log.exception("image inference failed")
         raise HTTPException(status_code=500, detail=f"image inference error: {e}")
+    detections = _suppress_image_overlaps(detections)
     latency_ms = int((time.time() - t0) * 1000)
-
-    # boxes:  (1, 300, 4)  cx, cy, w, h normalized
-    # logits: (1, 300, 13) raw logits, last channel is no-object
-    boxes = boxes[0]
-    logits = logits[0]
-
-    # Per-class sigmoid (RF-DETR uses independent sigmoid, NOT softmax).
-    probs = 1.0 / (1.0 + np.exp(-logits[:, : len(IMAGE_CLASSES)]))
-    best_class = probs.argmax(axis=1)
-    best_score = probs[np.arange(IMAGE_NUM_QUERIES), best_class]
-    keep = best_score >= req.threshold
-
-    # Per-field allow-list (canonical SpanLabel names). None = return all.
-    allowed = _resolve_allowed_labels(req.labels)
-    detections: List[ImageDetection] = []
-    for q in np.where(keep)[0]:
-        cx, cy, bw, bh = boxes[q]
-        x1 = max(0.0, (cx - bw / 2.0) * orig_w)
-        y1 = max(0.0, (cy - bh / 2.0) * orig_h)
-        w_px = bw * orig_w
-        h_px = bh * orig_h
-        if w_px <= 0 or h_px <= 0:
-            continue
-        label = IMAGE_CLASSES[int(best_class[q])]
-        if allowed is not None and label not in allowed:
-            continue
-        detections.append(
-            ImageDetection(
-                bbox=[int(x1), int(y1), int(w_px), int(h_px)],
-                label=label,
-                score=float(best_score[q]),
-            )
-        )
-    detections.sort(key=lambda d: -d.score)
 
     return DetectResponse(
         detections=detections,
@@ -1026,6 +996,111 @@ def image_detect(req: DetectRequest) -> DetectResponse:
         width=orig_w,
         height=orig_h,
     )
+
+
+def _image_inference_windows(width: int, height: int) -> List[Tuple[int, int, int, int]]:
+    """Return whole-frame plus four overlapping tiles for a large desktop.
+
+    The first entry is always the whole frame. Keeping that invariant matches
+    the desktop adapter and avoids losing larger PII that tiling magnifies out
+    of the detector's trained scale band.
+    """
+    windows = [(0, 0, width, height)]
+    big = width >= IMAGE_INPUT_SIZE * 2 and height >= IMAGE_INPUT_SIZE * 3 // 2
+    if not IMAGE_TILED_INFERENCE or not big:
+        return windows
+
+    tile_w, tile_h = width // 2, height // 2
+    overlap_x, overlap_y = tile_w // 5, tile_h // 5
+    for grid_y in range(2):
+        for grid_x in range(2):
+            x0 = max(0, grid_x * tile_w - overlap_x)
+            y0 = max(0, grid_y * tile_h - overlap_y)
+            x1 = min(width, (grid_x + 1) * tile_w + overlap_x)
+            y1 = min(height, (grid_y + 1) * tile_h + overlap_y)
+            if x1 > x0 and y1 > y0:
+                windows.append((x0, y0, x1 - x0, y1 - y0))
+    return windows
+
+
+def _infer_image_window(
+    image,
+    window: Tuple[int, int, int, int],
+    threshold: float,
+    allowed: Optional[Set[str]],
+    np,
+    Image,
+) -> List[ImageDetection]:
+    """Run one RF-DETR pass and map detections to full-frame coordinates."""
+    offset_x, offset_y, window_w, window_h = window
+    if window == (0, 0, image.width, image.height):
+        source = image
+    else:
+        source = image.crop(
+            (offset_x, offset_y, offset_x + window_w, offset_y + window_h)
+        )
+    resized = source.resize((IMAGE_INPUT_SIZE, IMAGE_INPUT_SIZE), Image.BILINEAR)
+
+    # ImageNet mean/std → NCHW float32. Same preprocessing as the desktop
+    # rfdetr_v38 adapter and the training/export pipeline.
+    arr = np.asarray(resized, dtype=np.float32) / 255.0
+    arr = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array(
+        [0.229, 0.224, 0.225], dtype=np.float32
+    )
+    arr = arr.transpose(2, 0, 1)[None].astype(np.float32)
+    boxes, logits = _image_session.run(
+        None, {_image_session.get_inputs()[0].name: arr}
+    )
+    boxes, logits = boxes[0], logits[0]
+
+    # RF-DETR uses independent sigmoid scores, not a class softmax. The final
+    # logit is no-object and is intentionally excluded.
+    probs = 1.0 / (1.0 + np.exp(-logits[:, : len(IMAGE_CLASSES)]))
+    best_class = probs.argmax(axis=1)
+    best_score = probs[np.arange(IMAGE_NUM_QUERIES), best_class]
+    detections: List[ImageDetection] = []
+    for query in np.where(best_score >= threshold)[0]:
+        cx, cy, box_w, box_h = boxes[query]
+        x1 = max(0.0, (cx - box_w / 2.0) * window_w) + offset_x
+        y1 = max(0.0, (cy - box_h / 2.0) * window_h) + offset_y
+        x2 = min(float(image.width), (cx + box_w / 2.0) * window_w + offset_x)
+        y2 = min(float(image.height), (cy + box_h / 2.0) * window_h + offset_y)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        label = IMAGE_CLASSES[int(best_class[query])]
+        if allowed is not None and label not in allowed:
+            continue
+        detections.append(
+            ImageDetection(
+                bbox=[int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+                label=label,
+                score=float(best_score[query]),
+            )
+        )
+    return detections
+
+
+def _image_iou(left: ImageDetection, right: ImageDetection) -> float:
+    """Intersection-over-union for two ``[x, y, width, height]`` boxes."""
+    lx, ly, lw, lh = left.bbox
+    rx, ry, rw, rh = right.bbox
+    intersection_w = max(0, min(lx + lw, rx + rw) - max(lx, rx))
+    intersection_h = max(0, min(ly + lh, ry + rh) - max(ly, ry))
+    intersection = intersection_w * intersection_h
+    union = lw * lh + rw * rh - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _suppress_image_overlaps(
+    detections: List[ImageDetection],
+) -> List[ImageDetection]:
+    """Greedily remove duplicate boxes emitted by overlapping tile passes."""
+    kept: List[ImageDetection] = []
+    for detection in sorted(detections, key=lambda item: -item.score):
+        if any(_image_iou(existing, detection) >= IMAGE_TILE_NMS_IOU for existing in kept):
+            continue
+        kept.append(detection)
+    return kept
 
 
 def _redact(text: str, spans: List[PiiSpan]) -> str:

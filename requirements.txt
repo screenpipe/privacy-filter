@@ -13,7 +13,7 @@ transformers==4.46.3
 tokenizers==0.20.3
 accelerate==1.1.1
 safetensors==0.4.5
-# Text + rfdetr_v19 image-PII inference. The pinned Tinfoil/vLLM base is CUDA 13;
+# Text + rfdetr_v38 image-PII inference. The pinned Tinfoil/vLLM base is CUDA 13;
 # ONNX Runtime 1.20.x wheels target CUDA 12 and silently fell back to CPU.
 # 1.29.x is the stable CUDA 13 + cuDNN 9 wheel line.
 onnxruntime-gpu==1.29.0

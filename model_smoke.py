@@ -30,10 +30,10 @@ def main() -> None:
 
     server._load_image_model()
     if server._image_session is None:
-        raise RuntimeError("rfdetr_v19 smoke: image session did not load")
+        raise RuntimeError("rfdetr_v38 smoke: image session did not load")
     if server.IMAGE_INPUT_SIZE != 512:
         raise RuntimeError(
-            f"rfdetr_v19 smoke: expected 512px input, got {server.IMAGE_INPUT_SIZE}"
+            f"rfdetr_v38 smoke: expected 512px input, got {server.IMAGE_INPUT_SIZE}"
         )
 
     image = Image.new("RGB", (640, 360), "white")
@@ -45,12 +45,16 @@ def main() -> None:
             threshold=0.50,
         )
     )
-    if response.model != "rfdetr_v19" or (response.width, response.height) != (640, 360):
-        raise RuntimeError(f"rfdetr_v19 smoke: unexpected response metadata: {response}")
+    if response.model != "rfdetr_v38" or (response.width, response.height) != (640, 360):
+        raise RuntimeError(f"rfdetr_v38 smoke: unexpected response metadata: {response}")
+
+    windows = server._image_inference_windows(1512, 948)
+    if len(windows) != 5 or windows[0] != (0, 0, 1512, 948):
+        raise RuntimeError(f"rfdetr_v38 smoke: tiled inference contract failed: {windows}")
 
     print(
         "model smoke OK: v50_distilled6l remap + inference; "
-        "rfdetr_v19 512px inference"
+        "rfdetr_v38 512px inference + whole-frame/four-tile contract"
     )
 
 
