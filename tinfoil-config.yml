@@ -115,12 +115,34 @@ containers:
       - "1"
       - "--flash-attn"
       - "on"
+      # Test wider CUDA prefill batches for long Screenpipe prompts. The
+      # defaults are 2048/512; staging must pass the VRAM and latency gates.
+      - "--batch-size"
+      - "4096"
+      - "--ubatch-size"
+      - "1024"
       - "--cache-type-k"
       - "q8_0"
       - "--cache-type-v"
       - "q8_0"
       - "--cache-ram"
       - "512"
+      # GLM's summaries and tool payloads repeat long spans. ngram-mod drafts
+      # those repetitions without loading a second model; the target still
+      # verifies every accepted token. Keep the MoE-oriented long draft sizes.
+      - "--spec-type"
+      - "ngram-mod"
+      - "--spec-ngram-size-n"
+      - "24"
+      - "--draft-min"
+      - "48"
+      - "--draft-max"
+      - "64"
+      # Export aggregate timing/slot counters on the enclave-private server so
+      # staged benchmarks can separate queue, prefill, and decode latency.
+      - "--metrics"
+      - "--slots"
+      - "--perf"
       - "--jinja"
       - "--chat-template-file"
       - "/app/glm-chat-template.jinja"
