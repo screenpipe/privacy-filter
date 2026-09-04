@@ -91,7 +91,9 @@ containers:
       start_period: "600s"
 
   - name: glm-5-3-flash
-    image: "ghcr.io/screenpipe/privacy-filter:glm-0.9.0@sha256:45482ce7bc219870bede87146a189a0bed5b72a0696304b4c4f2a88c9aa882a3"
+    # v0.9.1 layers the Pi-compatible replay template onto the exact tested
+    # v0.9.0 llama.cpp runtime; model code and weights are otherwise unchanged.
+    image: "ghcr.io/screenpipe/privacy-filter:glm-0.9.1@sha256:b2a54e7b62a5fbfcabceba7a63fff7774de5a47157add07a04352124658c1fbf"
     runtime: nvidia
     gpus: all
     restart: "always"
@@ -120,6 +122,8 @@ containers:
       - "--cache-ram"
       - "512"
       - "--jinja"
+      - "--chat-template-file"
+      - "/app/glm-chat-template.jinja"
       - "--override-kv"
       - "tokenizer.ggml.eot_token_id=int:154827"
       - "--override-kv"
