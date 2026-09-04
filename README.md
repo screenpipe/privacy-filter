@@ -123,7 +123,7 @@ The deployed CVM also carries Gemma E2B and its vLLM working set, so
 |---|---|
 | Quantized model | 67.2 GiB |
 | Parameters after expert pruning | about 165B (from 321B) |
-| Runtime context | 32,768 tokens, one parallel slot |
+| Runtime context | 65,536 tokens total, two 32,768-token parallel slots |
 | GPU offload | all layers on the H200 |
 | Prefill batches | 4,096 logical / 1,024 physical tokens |
 | Decode acceleration | `ngram-mod` self-speculation (16-token match, 4–32-token drafts) |
