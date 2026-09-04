@@ -3,7 +3,7 @@
 GPU-backed HTTP wrapper around two PII models plus co-hosted Gemma and GLM chat models in one Tinfoil enclave:
 
 1. [`screenpipe/pii-redactor`](https://huggingface.co/screenpipe/pii-redactor) (`v50_distilled6l`) — six-layer, vocab-pruned XLM-R token classifier for **text PII**. Endpoint `POST /filter`.
-2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v19`) — RF-DETR-Nano detector for **image PII** in screenshots, trained on real-app and synthetic screens. Endpoint `POST /image/detect`.
+2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v38`) — RF-DETR-Nano detector for **image PII** in screenshots. Large desktop frames use the same whole-frame + four-tile policy as the desktop app. Endpoint `POST /image/detect`.
 3. [`google/gemma-4-E2B-it`](https://huggingface.co/google/gemma-4-E2B-it) — chat + vision + **audio** via vLLM. Endpoint `POST /v1/chat/completions` with the backwards-compatible API model id `"gemma4-e4b"`. Weights are baked into the image (~10 GB BF16).
 4. [`patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF`](https://huggingface.co/patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF) — 50%-expert-pruned GLM-5.3-Flash, served from the 67.2 GiB `IQ3_M` quant by a pinned CUDA `llama-server`. Endpoint `POST /glm/v1/chat/completions`.
 
@@ -27,7 +27,7 @@ POST /filter         → {"text": "My email is alice@foo.com"}
 POST /image/detect   → {"image_b64": "<b64-jpg-or-png>", "threshold": 0.30}
                     ←  {"detections": [{"bbox": [x, y, w, h], "label": "private_person", "score": 0.95},
                                        {"bbox": [x, y, w, h], "label": "secret",        "score": 0.91}],
-                        "latency_ms": 32, "model": "rfdetr_v19",
+                        "latency_ms": 95, "model": "rfdetr_v38",
                         "width": 2880, "height": 1800}
 
 POST /glm/v1/chat/completions
@@ -60,7 +60,7 @@ curl -s -X POST http://localhost:8080/image/detect \
      -d "$(jq -nc --arg img "$B64" '{image_b64: $img, threshold: 0.30}')" | jq
 ```
 
-The first build downloads the v50 text contract (~133 MB across model, tokenizer, config, and vocabulary remap), the 60 MB rfdetr_v19 ONNX, and the baked Gemma weights. Subsequent builds use the build cache. Both HuggingFace revisions and every model artifact checksum are pinned, so a rebuild cannot silently drift to different weights.
+The first build downloads the v50 text contract (~133 MB across model, tokenizer, config, and vocabulary remap), the 60 MB rfdetr_v38 ONNX, and the baked Gemma weights. Subsequent builds use the build cache. Both HuggingFace revisions and every model artifact checksum are pinned, so a rebuild cannot silently drift to different weights.
 
 ## Deploy to Tinfoil
 
@@ -103,15 +103,16 @@ The first build downloads the v50 text contract (~133 MB across model, tokenizer
 | Runtime window | 256 tokens with 64-token overlap |
 | Local CPU reference | 7–9 ms for short captured strings |
 
-**Image model (`rfdetr_v19`) — CUDA EP:**
+**Image model (`rfdetr_v38`) — CUDA EP:**
 
 | Metric | Value |
 |---|---|
 | Weights (FP16, FP32 I/O) | 60 MB |
 | Params | ~25 M |
 | Input resolution | 512×512 |
-| Local CPU reference | ~118 ms/frame |
-| Real-app planted-secret gate | 19/19 detected at the production 0.50 floor |
+| Inference policy | whole frame + four overlapping tiles for large desktops |
+| Real captured-frame core recall | 81.2% for email/phone/secret with tiling (62.5% whole-frame only) |
+| Real-screen false-positive audit | 0 clear false positives across the held-out 240-frame set at 0.50 |
 
 The deployed CVM also carries Gemma E2B and its vLLM working set, so
 `tinfoil-config.yml` remains the source of truth for total CPU, memory, and GPU sizing.
@@ -138,7 +139,7 @@ The model and runtime are pinned by exact commits. Tinfoil mounts the measured m
 
 - **Text:** English-primary. Multilingual coverage per upstream model card varies.
 - **Text:** long inputs are split into overlapping 256-token windows; request size is capped separately by `MAX_INPUT_CHARS`.
-- **Image:** v19 is validated on released eval suites and planted real-app secrets, but unusual layouts, scripts, handwriting, occlusion, and adversarial inputs still need their own evaluation.
+- **Image:** v38 materially improves measured real-screen precision and tiled recall, but unusual layouts, scripts, handwriting, occlusion, and adversarial inputs still need their own evaluation.
 - **Image:** payload cap `MAX_IMAGE_BYTES=20 MB` (override via env). Decoded RGB working buffer is ~3× the payload.
 - **GLM:** the REAP50 `IQ3_M` build trades quality for fitting beside the existing workloads on one H200. Validate it on your own tasks before replacing a larger hosted model.
 - Not a compliance certification. One layer in a privacy-by-design stack.
@@ -147,4 +148,4 @@ The model and runtime are pinned by exact commits. Tinfoil mounts the measured m
 
 [PolyForm Noncommercial License 1.0.0](./LICENSE.md). You can read, run, fork, modify, and share — **noncommercial use only**. Commercial use requires a separate license; reach out to `louis@screenpi.pe`.
 
-Bundled / downloaded model weights keep their own licenses: `screenpipe/pii-redactor`, `screenpipe/pii-image-redactor` (`rfdetr_v19`), `google/gemma-4-E2B-it` (Gemma Terms of Use), and `patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF` (MIT). Using this deployment commercially means complying with all of them in addition to this repo's license.
+Bundled / downloaded model weights keep their own licenses: `screenpipe/pii-redactor`, `screenpipe/pii-image-redactor` (`rfdetr_v38`), `google/gemma-4-E2B-it` (Gemma Terms of Use), and `patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF` (MIT). Using this deployment commercially means complying with all of them in addition to this repo's license.

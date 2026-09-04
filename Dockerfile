@@ -13,7 +13,7 @@
 # tweaks) and ships ready-to-run. We don't actually use the 31B weights;
 # the base is just a convenient vLLM distribution.
 #
-# Our FastAPI server, v50_distilled6l text model, rfdetr_v19 image model, and
+# Our FastAPI server, v50_distilled6l text model, rfdetr_v38 image model, and
 # the baked-in Gemma 4 E2B weights are installed on top. `entrypoint.sh`
 # starts vLLM (E2B weights under the stable `gemma4-e4b` API id) in the
 # background and uvicorn in the foreground.
@@ -97,16 +97,16 @@ RUN useradd --system --no-create-home --uid 10001 appuser \
 # Image-PII detector. Same auto-download pattern as before — baked at
 # build time with SHA-256 verification so the resulting image hash is
 # reproducible across rebuilds.
-# rfdetr_v19 = the released real-app-trained detector (512×512, ~60 MB).
+# rfdetr_v38 = the real-screen-validated detector (512×512, ~60 MB).
 # It retains fp32 input/output around fp16 weights, so the existing numpy /
 # ONNX Runtime path remains compatible. The desktop and enclave now use the
 # same weights. server.py auto-detects the static input resolution at load.
 ARG IMAGE_MODEL_HF_REPO=screenpipe/pii-image-redactor
-ARG IMAGE_MODEL_REVISION=d4bb93370fc3fe3c36007bef22f71bd0e97a0951
-ARG IMAGE_MODEL_HF_FILE=rfdetr_v19.onnx
-ARG IMAGE_MODEL_SHA256=b9177c3ca7531da10366e57a6d74a5d2929da7479db6cc1f89419da194fa227f
-ENV IMAGE_MODEL_PATH=/opt/rfdetr_v19.onnx \
-    IMAGE_MODEL_ID="rfdetr_v19"
+ARG IMAGE_MODEL_REVISION=fa63646b0e67b216a59fe1cd22c8d9b6447af905
+ARG IMAGE_MODEL_HF_FILE=rfdetr_v38.onnx
+ARG IMAGE_MODEL_SHA256=0e968657aafcfb2c5d61ece264d5959ddeeec53091171fae226b45ecd3a8a880
+ENV IMAGE_MODEL_PATH=/opt/rfdetr_v38.onnx \
+    IMAGE_MODEL_ID="rfdetr_v38"
 ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
     https://huggingface.co/${IMAGE_MODEL_HF_REPO}/resolve/${IMAGE_MODEL_REVISION}/${IMAGE_MODEL_HF_FILE} \
     ${IMAGE_MODEL_PATH}
