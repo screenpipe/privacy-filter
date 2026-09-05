@@ -108,19 +108,46 @@ containers:
       - "--port"
       - "8002"
       - "--ctx-size"
-      - "32768"
+      # llama.cpp divides the total context across slots. Keep the full 32k
+      # Screenpipe window per request while allowing a second request to start
+      # immediately instead of queueing behind a long Day Recap generation.
+      - "65536"
       - "--n-gpu-layers"
       - "999"
       - "--parallel"
-      - "1"
+      - "2"
       - "--flash-attn"
       - "on"
+      # Test wider CUDA prefill batches for long Screenpipe prompts. The
+      # defaults are 2048/512; staging must pass the VRAM and latency gates.
+      - "--batch-size"
+      - "4096"
+      - "--ubatch-size"
+      - "1024"
       - "--cache-type-k"
       - "q8_0"
       - "--cache-type-v"
       - "q8_0"
       - "--cache-ram"
       - "512"
+      # GLM's summaries and tool payloads repeat short spans. ngram-mod drafts
+      # those repetitions without loading a second model; the target still
+      # verifies every accepted token. A 16-token match avoids the poor-quality
+      # range warned about by llama.cpp while 4–32 token drafts cover brief
+      # filenames, UI labels, and tool-result fragments.
+      - "--spec-type"
+      - "ngram-mod"
+      - "--spec-ngram-size-n"
+      - "16"
+      - "--draft-min"
+      - "4"
+      - "--draft-max"
+      - "32"
+      # Export aggregate timing/slot counters on the enclave-private server so
+      # staged benchmarks can separate queue, prefill, and decode latency.
+      - "--metrics"
+      - "--slots"
+      - "--perf"
       - "--jinja"
       - "--chat-template-file"
       - "/app/glm-chat-template.jinja"
