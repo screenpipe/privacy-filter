@@ -15,6 +15,11 @@ on:
         description: "Optional exact privacy-filter-glm image to promote into the public privacy-filter package"
         required: false
         type: string
+      sampler_fix:
+        description: "Build the tested response-budget fix on the exact pinned GLM runtime"
+        required: false
+        type: boolean
+        default: false
       base:
         description: "Optional exact public GLM runtime to wrap with this repo's Pi-compatible chat template"
         required: false
@@ -128,7 +133,7 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
-          file: Dockerfile.glm-template
+          file: ${{ inputs.sampler_fix && 'Dockerfile.glm-sampler' || 'Dockerfile.glm-template' }}
           platforms: linux/amd64
           push: true
           provenance: false

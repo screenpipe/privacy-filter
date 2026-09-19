@@ -1,0 +1,41 @@
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -437,9 +437,14 @@
+     const auto tm = gsmpl->tm();
+ 
+     // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
++    const bool generated = accept_grammar;
+     accept_grammar = accept_grammar && grammar_should_apply(gsmpl);
+ 
+-    llama_sampler_accept(gsmpl->rbudget, token);
++    // Prompt replay seeds repetition penalties, not the next response's budget.
++    // Its generation prefill was already accounted for in sampler initialization.
++    if (generated) {
++        llama_sampler_accept(gsmpl->rbudget, token);
++    }
+ 
+     if (gsmpl->grmr && accept_grammar) {
+         llama_sampler_accept(gsmpl->grmr, token);
+--- a/common/reasoning-budget.cpp
++++ b/common/reasoning-budget.cpp
+@@ -165,13 +165,19 @@
+ 
+ static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
+     const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+-    return common_reasoning_budget_init_state(
++    auto * clone = common_reasoning_budget_init_state(
+         ctx->vocab,
+         ctx->start_matcher.tokens,
+         ctx->end_matcher.tokens,
+         ctx->forced_tokens,
+         ctx->budget,
+         ctx->state);
++    auto * cloned = (common_reasoning_budget_ctx *) clone->ctx;
++    cloned->remaining = ctx->remaining;
++    cloned->force_pos = ctx->force_pos;
++    cloned->start_matcher.pos = ctx->start_matcher.pos;
++    cloned->end_matcher.pos = ctx->end_matcher.pos;
++    return clone;
+ }
+ 
+ static void common_reasoning_budget_free(struct llama_sampler * smpl) {
