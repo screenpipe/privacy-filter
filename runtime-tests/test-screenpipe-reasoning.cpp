@@ -8,7 +8,7 @@
 #include <cassert>
 
 int main() {
-    auto * budget = common_reasoning_budget_init(nullptr, {10}, {11}, {11}, 3, std::vector<llama_token>{10});
+    auto * budget = common_reasoning_budget_init(nullptr, {10}, {11}, {11}, 3, std::vector<llama_token>{99, 10});
     auto * sampler = new common_sampler { {}, nullptr, budget,
         llama_sampler_chain_init(llama_sampler_chain_default_params()),
         ring_buffer<llama_token>(32), {}, {} };
@@ -28,5 +28,14 @@ int main() {
     assert(common_reasoning_budget_get_state(budget) == REASONING_BUDGET_DONE);
     common_sampler_free(copy);
     common_sampler_free(sampler);
+    // Closed thinking stays idle; a later open block restarts the budget.
+    for (const auto & prefill : std::vector<std::vector<llama_token>>{{99, 10, 2, 11}, {99, 10, 2, 11, 99, 10}}) {
+        auto * b = common_reasoning_budget_init(nullptr, {10}, {11}, {11}, 3, prefill);
+        assert(common_reasoning_budget_get_state(b) == (prefill.back() == 10 ? REASONING_BUDGET_COUNTING : REASONING_BUDGET_IDLE));
+        llama_sampler_free(b);
+    }
+    auto * zero = common_reasoning_budget_init(nullptr, {10}, {11}, {11}, 0, std::vector<llama_token>{99, 10});
+    assert(common_reasoning_budget_get_state(zero) == REASONING_BUDGET_FORCING);
+    llama_sampler_free(zero);
     puts("Prompt replay and speculative clone retain the response reasoning budget");
 }

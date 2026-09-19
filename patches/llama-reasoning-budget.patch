@@ -39,3 +39,37 @@
  }
  
  static void common_reasoning_budget_free(struct llama_sampler * smpl) {
+@@ -225,22 +231,18 @@
+         const std::vector<llama_token> & forced_tokens,
+         int32_t                          budget,
+         const std::vector<llama_token> & prefill_tokens) {
+-    // Determine initial state from prefill: COUNTING if the prefill begins with
+-    // the start sequence but does not also contain the end sequence after it.
++    // Generation prefills may start with an assistant-role token before
++    // <think>. Track the final open block without spending generated tokens.
+     common_reasoning_budget_state initial_state = REASONING_BUDGET_IDLE;
+-    if (!prefill_tokens.empty() && !start_tokens.empty() &&
+-            prefill_tokens.size() >= start_tokens.size() &&
+-            std::equal(start_tokens.begin(), start_tokens.end(), prefill_tokens.begin())) {
+-        initial_state = REASONING_BUDGET_COUNTING;
+-        // If the end sequence also follows the start in the prefill, reasoning
+-        // was opened and immediately closed — stay IDLE.
+-        if (!end_tokens.empty() &&
+-                prefill_tokens.size() >= start_tokens.size() + end_tokens.size()) {
+-            auto end_start = prefill_tokens.end() - (ptrdiff_t) end_tokens.size();
+-            if (end_start >= prefill_tokens.begin() + (ptrdiff_t) start_tokens.size() &&
+-                    std::equal(end_tokens.begin(), end_tokens.end(), end_start)) {
+-                initial_state = REASONING_BUDGET_IDLE;
+-            }
++    token_matcher start_matcher { start_tokens, 0 };
++    token_matcher end_matcher { end_tokens, 0 };
++    for (const auto token : prefill_tokens) {
++        if (start_matcher.advance(token)) {
++            initial_state = REASONING_BUDGET_COUNTING;
++            end_matcher.reset();
++        } else if (end_matcher.advance(token)) {
++            initial_state = REASONING_BUDGET_IDLE;
++            start_matcher.reset();
+         }
+     }
+     return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, budget, initial_state);
