@@ -1,0 +1,28 @@
+# screenpipe — AI that knows everything you've seen, said, or heard
+# https://screenpipe.com
+# Rebuild only the server/common code. GPU kernels, model libraries and weights
+# remain byte-identical to the exact base image built from this same commit.
+ARG GLM_RUNTIME_BASE
+FROM ${GLM_RUNTIME_BASE} AS build
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc-14 g++-14 cmake make git libssl-dev && rm -rf /var/lib/apt/lists/*
+ENV CC=gcc-14 CXX=g++-14
+WORKDIR /src
+RUN curl -fsSL https://github.com/patrickbdevaney/llama.cpp/archive/2a4a41238175cc5d0ee3e591865653e49096c782.tar.gz -o source.tar.gz \
+    && echo "30937929a7b96a4ce1e6783fa5036139d678debcf21f570efd60bff127156ba0  source.tar.gz" | sha256sum -c - \
+    && tar -xzf source.tar.gz --strip-components=1 && rm source.tar.gz
+COPY patches/llama-reasoning-budget.patch /tmp/runtime.patch
+COPY runtime-tests/test-screenpipe-reasoning.cpp tests/test-screenpipe-reasoning.cpp
+RUN git apply --check /tmp/runtime.patch && git apply /tmp/runtime.patch \
+    && printf '\nllama_build_and_test(test-screenpipe-reasoning.cpp)\n' >> tests/CMakeLists.txt \
+    && cmake -S . -B build -DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DGGML_BACKEND_DL=ON \
+       -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF \
+       -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
+    && cmake --build build --target llama-server test-screenpipe-reasoning test-reasoning-budget -j4 \
+    && build/bin/test-screenpipe-reasoning && build/bin/test-reasoning-budget
+FROM ${GLM_RUNTIME_BASE}
+COPY --from=build /src/build/bin/llama-server /app/llama-server
+COPY glm-chat-template.jinja /app/glm-chat-template.jinja
+# Check the rebuilt executable links against the original runtime libraries.
+RUN /app/llama-server --version

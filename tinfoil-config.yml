@@ -91,9 +91,9 @@ containers:
       start_period: "600s"
 
   - name: glm-5-3-flash
-    # v0.9.1 layers the Pi-compatible replay template onto the exact tested
-    # v0.9.0 llama.cpp runtime; model code and weights are otherwise unchanged.
-    image: "ghcr.io/screenpipe/privacy-filter:glm-0.9.1@sha256:b2a54e7b62a5fbfcabceba7a63fff7774de5a47157add07a04352124658c1fbf"
+    # Fix response-budget accounting, GLM prefill recognition and sampler cloning.
+    # GPU libraries and measured model weights remain unchanged.
+    image: "ghcr.io/screenpipe/privacy-filter:glm-0.9.3-rc2@sha256:ece9445a85f585ac8bdb77bd45725c552a2d949dce23c7e573492c33a6da4b68"
     runtime: nvidia
     gpus: all
     restart: "always"
