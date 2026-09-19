@@ -108,6 +108,11 @@ jobs:
       - name: Check out Screenpipe runtime wrapper
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
+      - name: Test GLM reasoning and tool replay template
+        run: |
+          python3 -m pip install jinja2==3.1.6
+          python3 -m unittest test_glm_chat_template.py
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
