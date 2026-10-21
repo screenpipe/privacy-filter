@@ -1,3 +1,6 @@
+<!-- screenpipe — AI that knows everything you've seen, said, or heard -->
+<!-- https://screenpipe.com -->
+
 # privacy-filter
 
 GPU-backed HTTP wrapper around two PII models plus co-hosted Gemma and GLM chat models in one Tinfoil enclave:
@@ -89,8 +92,23 @@ The first build downloads the v50 text contract (~133 MB across model, tokenizer
    the current instance stays live unless the candidate becomes healthy and
    is accepted.
 
-4. **Verify** — the service is now reachable at
-   `https://privacy-filter.<org>.containers.tinfoil.dev/health`.
+4. **Verification and client trust selection happen automatically.** Every
+   measurement build creates a prerelease, leaving clients on the deployed
+   build. `Verify live Tinfoil release` checks after builds and on GitHub's
+   five-minute schedule: exact-tag Sigstore provenance, AMD hardware
+   attestation, TLS binding, and a synthetic PII request must all pass before
+   it selects the deployed release as GitHub latest. No separate release edit
+   or publishing click is required. Source ancestry prevents an automatic
+   rollback to arbitrary historical signed code; the initial repair is pinned
+   to the exact known release IDs and verified manifest digest.
+
+   A deployment can pause privacy processing until that automated check runs;
+   GitHub schedules can be delayed. Build-only candidates do not change client
+   trust. Failed checks leave selection unchanged and surface in Actions;
+   subsequent scheduled runs retry. Existing required-PII clients retain their
+   pending recordings during the pause. The read-only diagnostic is
+   `python3 scripts/reconcile_tinfoil_release.py` after building
+   `tools/tinfoil-release-check`; `--apply` is reserved for the workflow.
 
 ## Resource sizing (GPU)
 
