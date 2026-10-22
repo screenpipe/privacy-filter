@@ -1,0 +1,58 @@
+# screenpipe — AI that knows everything you've seen, said, or heard
+# https://screenpipe.com
+name: Verify live Tinfoil release
+
+on:
+  workflow_run:
+    workflows: [Build and Attest]
+    types: [completed]
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tinfoil-*.yml'
+      - 'scripts/*tinfoil*'
+      - 'tools/tinfoil-release-check/**'
+  # GitHub's minimum scheduled interval is five minutes. The schedule also
+  # picks up deployments completed after the build job finishes.
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: tinfoil-production-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - run: python3 -m unittest discover -s scripts -p 'test_tinfoil*.py' -v
+  reconcile:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: main
+      - name: Identify verifier toolchain
+        id: toolchain
+        run: echo "version=$(rustc --version | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: tools/tinfoil-release-check/target
+          key: ${{ runner.os }}-${{ runner.arch }}-tinfoil-${{ steps.toolchain.outputs.version }}-${{ hashFiles('tools/tinfoil-release-check/Cargo.lock', 'tools/tinfoil-release-check/Cargo.toml', 'tools/tinfoil-release-check/src/**') }}
+      - name: Build pinned attestation verifier
+        run: |
+          cargo test --locked --release --manifest-path tools/tinfoil-release-check/Cargo.toml
+          cargo build --locked --release --manifest-path tools/tinfoil-release-check/Cargo.toml
+      - name: Select only the verified live release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/reconcile_tinfoil_release.py --apply
