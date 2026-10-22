@@ -32,8 +32,6 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.calls.append(args)
         if args[:2] == ("gh", "api"):
             path = args[-1]
-            if "/compare/" in path:
-                return json.dumps({"status": "behind" if path.endswith("v2...v1") else "ahead"})
             if path.endswith("/assets/1"):
                 return self.text
             if path.endswith("/assets/2"):
@@ -48,6 +46,8 @@ class ReleaseLifecycleTests(unittest.TestCase):
             self.assertIn("--cert-identity", args)
             self.assertIn("--cert-oidc-issuer", args)
             return json.dumps([{"verificationResult": {"statement": {"predicate": self.manifest}}}])
+        if len(args) > 1 and args[1] == "newer":
+            return json.dumps(args[2:] == ("v1", "v2"))
         if len(args) > 1 and args[1] == "verify":
             if self.bad_hardware:
                 raise RuntimeError("SNP mismatch during deployment rotation")
@@ -86,7 +86,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
         previous = {**self.old, "id": release.LEGACY_REPAIR[1]}
         incorrect_latest = {**self.new, "id": release.LEGACY_REPAIR[0]}
         self.assertTrue(release.eligible(previous, incorrect_latest, self.run_command))
-        self.assertFalse(release.eligible({**previous, "id": 999}, incorrect_latest, lambda *args: json.dumps({"status":"behind"})))
+        self.assertFalse(release.eligible({**previous, "id": 999}, incorrect_latest, lambda *args: "false"))
         # Even the exact metadata pair cannot authorize a different artifact.
         with self.assertRaisesRegex(ValueError, "legacy repair artifact changed"):
             release.reconcile(self.hardware, [previous], incorrect_latest, True, self.run_command)

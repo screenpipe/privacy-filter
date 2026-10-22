@@ -10,7 +10,6 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from urllib.parse import quote
 import subprocess
 import tempfile
 
@@ -78,12 +77,11 @@ def eligible(release, current, run=command):
         return True
     if (current["id"], release["id"]) == LEGACY_REPAIR[:2]:
         return True
-    # Never silently authorize a rollback to arbitrary historical signed code.
-    # Use Git ancestry rather than mutable release publication timestamps or
-    # assumptions about which forms of semantic version tags are in use.
-    comparison = json.loads(run("gh", "api", f"repos/{REPO}/compare/"
-                                f"{quote(current['tag_name'], safe='')}...{quote(release['tag_name'], safe='')}"))
-    return comparison["status"] in ("ahead", "identical")
+    # Squash merges make source ancestry diverge during normal releases.
+    # The exact tag identity is authenticated below; SemVer precedence is the
+    # forward-only release boundary (build metadata does not increase it).
+    return json.loads(run(str(ROOT / "tools/tinfoil-release-check/target/release/tinfoil-release-check"),
+                          "newer", current["tag_name"], release["tag_name"]))
 
 
 def reconcile(hardware, releases, current, apply=False, run=command):
