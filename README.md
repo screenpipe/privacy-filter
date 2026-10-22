@@ -98,7 +98,7 @@ The first build downloads the v50 text contract (~133 MB across model, tokenizer
    five-minute schedule: exact-tag Sigstore provenance, AMD hardware
    attestation, TLS binding, and a synthetic PII request must all pass before
    it selects the deployed release as GitHub latest. No separate release edit
-   or publishing click is required. Source ancestry prevents an automatic
+   or publishing click is required. Signed release-version order prevents an automatic
    rollback to arbitrary historical signed code; the initial repair is pinned
    to the exact known release IDs and verified manifest digest.
 

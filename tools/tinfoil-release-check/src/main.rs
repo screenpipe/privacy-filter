@@ -12,6 +12,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _init = tinfoil::SecureClient::new(HOST, REPO, "");
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("newer") if args.len() == 4 => {
+            println!("{}", newer_release(&args[2], &args[3])?);
+        }
         Some("inspect") => {
             let report = attestation::fetch(HOST).await?;
             let verified = attestation::verify_full(&report).await?;
@@ -41,12 +44,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "usage: tinfoil-release-check inspect | latest | verify <verified-manifest.json>"
+                "usage: tinfoil-release-check inspect | latest | newer <current-tag> <candidate-tag> | verify <verified-manifest.json>"
                     .into(),
             )
         }
     }
     Ok(())
+}
+
+fn newer_release(current: &str, candidate: &str) -> Result<bool, semver::Error> {
+    let version = |tag: &str| semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag));
+    Ok(version(candidate)?
+        .cmp_precedence(&version(current)?)
+        .is_gt())
 }
 
 fn manifest_measurement(manifest: &Value) -> Result<Measurement, Box<dyn std::error::Error>> {
@@ -79,6 +89,17 @@ fn validate_redaction(body: &Value) -> Result<&str, Box<dyn std::error::Error>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_release_order_is_independent_of_branch_ancestry() {
+        assert!(newer_release("v0.9.10-rc1", "v0.9.11-rc1").unwrap());
+        assert!(newer_release("v0.9.10-rc1", "v0.10.0").unwrap());
+        assert!(newer_release("v0.9.11-rc1", "v0.9.11").unwrap());
+        assert!(!newer_release("v0.9.11-rc1", "v0.9.10-rc1").unwrap());
+        assert!(!newer_release("v0.9.11", "v0.9.11-rc1").unwrap());
+        assert!(!newer_release("v0.9.11+first", "v0.9.11+second").unwrap());
+        assert!(newer_release("v0.9.11", "unversioned").is_err());
+    }
 
     #[test]
     fn missing_or_invalid_registers_cannot_build_a_trusted_measurement() {

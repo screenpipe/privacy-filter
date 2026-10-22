@@ -2082,6 +2082,7 @@ dependencies = [
 name = "tinfoil-release-check"
 version = "0.1.0"
 dependencies = [
+ "semver",
  "serde_json",
  "tinfoil",
  "tokio",
