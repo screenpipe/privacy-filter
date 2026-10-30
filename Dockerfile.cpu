@@ -1,0 +1,49 @@
+# screenpipe — AI that knows everything you've seen, said, or heard
+# https://screenpipe.com
+FROM python:3.12-slim-bookworm
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
+    PRIVACY_ONLY=true ORT_NUM_THREADS=4 PORT=8080 HOME=/home/appuser
+WORKDIR /app
+COPY requirements.cpu.txt /app/requirements.cpu.txt
+RUN pip install --no-cache-dir -r requirements.cpu.txt
+ARG SOURCE_MODEL_ID=screenpipe/pii-redactor
+ARG SOURCE_MODEL_REVISION=5c907008e2a2ad394712496a26819ad28dd44662
+ARG SOURCE_MODEL_SUBFOLDER=v50_distilled6l
+ENV MODEL_DIR=/opt/model \
+    MODEL_ID="screenpipe/pii-redactor:v50_distilled6l (mixed-int4-int8-onnx)"
+COPY build_download.py /tmp/build_download.py
+RUN useradd --system --no-create-home --uid 10001 appuser \
+    && SOURCE_MODEL_ID=$SOURCE_MODEL_ID \
+       SOURCE_MODEL_REVISION=$SOURCE_MODEL_REVISION \
+       SOURCE_MODEL_SUBFOLDER=$SOURCE_MODEL_SUBFOLDER \
+       MODEL_DIR=$MODEL_DIR \
+       python3 /tmp/build_download.py \
+    && rm -rf /root/.cache/huggingface /tmp/build_download.py \
+    && chown -R appuser:appuser $MODEL_DIR
+
+# Image-PII detector. Same auto-download pattern as before — baked at
+# build time with SHA-256 verification so the resulting image hash is
+# reproducible across rebuilds.
+# rfdetr_v38 = the real-screen-validated detector (512×512, ~60 MB).
+# It retains fp32 input/output around fp16 weights, so the existing numpy /
+# ONNX Runtime path remains compatible. The desktop and enclave now use the
+# same weights. server.py auto-detects the static input resolution at load.
+ARG IMAGE_MODEL_HF_REPO=screenpipe/pii-image-redactor
+ARG IMAGE_MODEL_REVISION=fa63646b0e67b216a59fe1cd22c8d9b6447af905
+ARG IMAGE_MODEL_HF_FILE=rfdetr_v38.onnx
+ARG IMAGE_MODEL_SHA256=0e968657aafcfb2c5d61ece264d5959ddeeec53091171fae226b45ecd3a8a880
+ENV IMAGE_MODEL_PATH=/opt/rfdetr_v38.onnx \
+    IMAGE_MODEL_ID="rfdetr_v38"
+ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
+    https://huggingface.co/${IMAGE_MODEL_HF_REPO}/resolve/${IMAGE_MODEL_REVISION}/${IMAGE_MODEL_HF_FILE} \
+    ${IMAGE_MODEL_PATH}
+RUN chown appuser:appuser ${IMAGE_MODEL_PATH}
+
+
+COPY server.py test_image_tiling.py test_cpu_mode.py cpu_smoke.py /app/
+RUN python3 -m unittest test_cpu_mode test_image_tiling -v && python3 cpu_smoke.py
+USER 10001
+EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=5s --retries=10 --start-period=120s \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4)"
+CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
