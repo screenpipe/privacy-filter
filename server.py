@@ -88,6 +88,23 @@ BATCH_MAX_SIZE = int(os.environ.get("BATCH_MAX_SIZE", "16"))
 #   gemma4-e4b on 127.0.0.1:8001 — chat + vision + audio.
 # The 31B does NOT run here — it stays on Tinfoil's hosted
 # inference.tinfoil.sh path, reached separately by the gateway.
+# Explicit CPU privacy-only deployment; GPU releases retain their old defaults.
+PRIVACY_ONLY = os.environ.get("PRIVACY_ONLY", "false").lower() == "true"
+
+
+def _ort_providers() -> list[str]:
+    return ["CPUExecutionProvider"] if PRIVACY_ONLY else ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+
+def _ort_options(ort):
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if PRIVACY_ONLY:
+        opts.intra_op_num_threads = int(os.environ.get("ORT_NUM_THREADS", "4"))
+        opts.inter_op_num_threads = 1
+    return opts
+
+
 GEMMA_UPSTREAM = os.environ.get("GEMMA_UPSTREAM", "http://127.0.0.1:8001")
 # GLM runs as a sibling Tinfoil container on the enclave's private network.
 # Keeping it under /glm/v1/* preserves every existing Gemma and PII route.
@@ -425,10 +442,11 @@ def _load_model() -> None:
     # inference instead of crash-looping the whole container.
     _session = ort.InferenceSession(
         os.path.join(MODEL_DIR, "model_quantized.onnx"),
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        sess_options=_ort_options(ort),
+        providers=_ort_providers(),
     )
     active = _session.get_providers()
-    if "CUDAExecutionProvider" not in active:
+    if not PRIVACY_ONLY and "CUDAExecutionProvider" not in active:
         log.warning(
             "text model running WITHOUT CUDA (providers=%s) — results are "
             "correct but slower; check onnxruntime-gpu + CUDA libs", active)
@@ -452,19 +470,15 @@ def _load_image_model() -> None:
             IMAGE_MODEL_PATH,
         )
         return
-    log.info("loading image model from %s onto CUDA EP", IMAGE_MODEL_PATH)
+    log.info("loading image model from %s (providers=%s)", IMAGE_MODEL_PATH, _ort_providers())
     t0 = time.time()
     import onnxruntime as ort
 
-    opts = ort.SessionOptions()
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts = _ort_options(ort)
     # CUDA first, then CPU as a final availability fallback. The pinned
     # vLLM base does not ship TensorRT libraries, so requesting TensorRT here
     # only produces a loader error before ONNX Runtime retries with CUDA.
-    providers = [
-        "CUDAExecutionProvider",
-        "CPUExecutionProvider",
-    ]
+    providers = _ort_providers()
     _image_session = ort.InferenceSession(
         IMAGE_MODEL_PATH,
         opts,
@@ -488,7 +502,7 @@ def _load_image_model() -> None:
         providers,
         IMAGE_INPUT_SIZE,
     )
-    if active == "CPUExecutionProvider":
+    if not PRIVACY_ONLY and active == "CPUExecutionProvider":
         log.warning(
             "image model is running on CPU — the CUDA provider did not "
             "initialize. Inference will work but with higher "
@@ -506,7 +520,7 @@ def _load_image_model() -> None:
     try:
         _image_session.run(None, {_image_session.get_inputs()[0].name: dummy})
         log.info(
-            "image model CUDA warmup completed in %.1fs",
+            "image model warmup completed in %.1fs",
             time.time() - warm_t0,
         )
     except Exception as e:
@@ -525,6 +539,8 @@ async def _open_gemma_proxy() -> None:
     /v1/* eats any remaining warmup wait via httpx's retry/connect logic.
     """
     global _gemma_client
+    if PRIVACY_ONLY:
+        return
     _gemma_client = httpx.AsyncClient(
         base_url=GEMMA_UPSTREAM,
         # No outer timeout — chat completions can stream for minutes. The
@@ -540,6 +556,8 @@ async def _open_gemma_proxy() -> None:
 @app.on_event("startup")
 async def _open_glm_proxy() -> None:
     global _glm_client
+    if PRIVACY_ONLY:
+        return
     _glm_client = httpx.AsyncClient(
         base_url=GLM_UPSTREAM,
         timeout=httpx.Timeout(None, connect=10.0),
@@ -839,6 +857,13 @@ async def healthz() -> dict:
     never goes unhealthy for gemma reasons; external monitors read its
     `gemma_ready` / `gemma_down_seconds` fields instead.
     """
+    if PRIVACY_ONLY:
+        if _session is None or _image_session is None:
+            raise HTTPException(status_code=503, detail="Both privacy models must be ready")
+        state = _pii_gpu_state()
+        if state["text_provider"] != "CPUExecutionProvider" or state["image_provider"] != "CPUExecutionProvider":
+            raise HTTPException(status_code=503, detail="CPU privacy providers unavailable")
+        return {"status": "ok", "privacy_only": True, **state}
     gemma_ready = await _probe_gemma()
     down_for = _gemma_down_seconds(gemma_ready)
     if not gemma_ready and down_for > GEMMA_UNHEALTHY_AFTER:

@@ -29,6 +29,12 @@ on:
         required: false
         type: string
 
+      cpu_only:
+        description: "Build privacy-only CPU image (no GPU or generative models)"
+        required: false
+        type: boolean
+        default: true
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -44,6 +50,7 @@ jobs:
       # ("No space left on device"). Reclaim ~30 GB of preinstalled
       # toolchains we don't use before building.
       - name: Free disk space
+        if: ${{ !inputs.cpu_only }}
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -85,12 +92,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ inputs.cpu_only && './Dockerfile.cpu' || './Dockerfile' }}
           platforms: linux/amd64
           push: true
           tags: |
             ghcr.io/screenpipe/privacy-filter:${{ steps.version.outputs.version }}
-            ghcr.io/screenpipe/privacy-filter:latest
+            ${{ !inputs.cpu_only && 'ghcr.io/screenpipe/privacy-filter:latest' || '' }}
           # Reuse buildx cache across runs so weight download + torch
           # wheel install don't repeat on every minor tag bump.
           cache-from: type=gha,scope=privacy-filter

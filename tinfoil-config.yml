@@ -1,192 +1,36 @@
-# screenpipe — Tinfoil confidential-compute deployment for the privacy-filter
-# service. Update the image digest below after pushing to ghcr.io (CI can do
-# this automatically; for a manual release see README.md).
-#
-# Deploy via the Tinfoil dashboard (https://dash.tinfoil.sh): create an org,
-# connect GitHub, point it at this repo, push a git tag. Tinfoil auto-pulls
-# the image at the pinned digest, runs remote attestation, and exposes the
-# service at https://<name>.<org>.containers.tinfoil.dev.
-#
-# ── v0.9.0: co-host GLM-5.3-Flash REAP50 ──────────────────────────────
-# One enclave, one shim, two containers, three GPU workloads on the H200
-# (~141 GB VRAM):
-#   1. privacy-filter   (text PII + image PII)                 ~16 GB
-#   2. Gemma 4 E4B vLLM (chat + vision + audio, BF16)          ~21 GB
-#      (16 GB weights + ~5 GB KV at --gpu-memory-utilization 0.25)
-#   3. GLM-5.3-Flash REAP50 IQ3_M llama.cpp                    67.2 GiB
-# The 31B model stays on Tinfoil's hosted inference.tinfoil.sh path,
-# reached via packages/ai-gateway in the Cloudflare worker — it's a
-# different model with different trade-offs, not a replacement for E4B.
-# E4B is the only Gemma 4 variant with native audio understanding.
-#
-# vLLM runs as a sibling process inside the privacy-filter container;
-# FastAPI proxies /v1/* to it on localhost:8001. GLM runs in its own
-# container on the enclave-private `models` network and is exposed only
-# through the existing FastAPI router under /glm/v1/*.
-
+# screenpipe — AI that knows everything you've seen, said, or heard
+# https://screenpipe.com
+# CPU-only PII service. Generative model routes are intentionally not exposed.
 cvm-version: 0.11.0
-
-# CPU stays at 16 (vLLM scheduler is light). Memory at 131072 (128 GB)
-# because the image includes ~10 GB of baked E2B weights (served under the
-# stable gemma4-e4b API id; E2B isn't on Tinfoil's modelwrap system yet)
-# and needs more ramdisk room during pull. Tinfoil only accepts fixed memory
-# tiers, so 128 GB remains selected. The measured GLM package is mounted
-# read-only instead of copied into the container ramdisk.
-cpus: 16
-memory: 131072
-gpus: 1
-
-networks:
-  models: {}
-
-models:
-  - name: "glm-5-3-flash-reap50-iq3m"
-    repo: "patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF@dfe3665e9e006548d97d0b58457628637eef6e0c"
-    mpk: "260fbbbd8ad74cb2ec338e65fd4d3b4afd0cee508c2455886882f2813ca93ad0_433533227008_0809c1e6-6b9b-57eb-b2b8-37bef6f8a5c5"
+cpus: 8
+memory: 16384
+gpus: 0
 
 containers:
   - name: privacy-filter
-    # Pinned via .github/workflows/release.yml (workflow_dispatch).
-    # Bump flow: dispatch release.yml → copy digest from "Print digest"
-    # step → paste here → commit → push a new `v*` tag to trigger
-    # tinfoil-build.yml which attests this exact digest.
-    image: "ghcr.io/screenpipe/privacy-filter:0.9.7@sha256:ae9d83fb05ee8057c444e4d7b43f68c6a963daf24034fbcf24bd7057093db321"
-    runtime: nvidia
-    gpus: all
-    # The RF-DETR artifact is intentionally owner-readable (0600) by the
-    # image's appuser. CVM 0.11 drops root's DAC_OVERRIDE capability, so run
-    # as that owner instead of weakening the hardened capability set.
+    image: "ghcr.io/screenpipe/privacy-filter:0.10.0-cpu.rc1@sha256:c303fb570ee5f3e1af88bc7ee54101979fdaac020855bbe7c490b5e30a43933f"
     user: "10001:999"
     env:
       - PORT: "8080"
       - HOME: "/home/appuser"
-      # vLLM listens on this loopback port; server.py reverse-proxies
-      # /v1/* to it. Same container = same network namespace = 127.0.0.1.
-      - GEMMA_UPSTREAM: "http://127.0.0.1:8001"
-      - GLM_UPSTREAM: "http://glm-5-3-flash:8002"
-    secrets:
-      # Application-owned auth for the public GLM proxy. Custom Containers do
-      # not use Tinfoil's managed Private Inference subscription/key service.
-      - GLM_API_KEY
-    networks: ["models"]
-    # CVM 0.11 hardens container roots as read-only. Python/torch require a
-    # writable temporary directory, and vLLM compiles under the user's home.
-    # Keep both writable surfaces bounded and in-memory.
+      - PRIVACY_ONLY: "true"
+      - ORT_NUM_THREADS: "4"
     tmpfs:
-      /tmp: size=8g,mode=1777,exec
-      /home/appuser: size=8g,mode=0700,uid=10001,gid=999,exec
+      /tmp: size=256m,mode=1777
+      /home/appuser: size=64m,mode=0700,uid=10001,gid=999
     restart: "always"
     healthcheck:
-      # Candidate gate: require both PII ONNX sessions on GPU plus Gemma and
-      # GLM ready before blue-green promotion. The public PII endpoints retain
-      # CPU fallback for live availability, while an already-running Gemma
-      # still uses the separate /healthz watchdog/restart policy below.
-      test: ["CMD", "python3", "-c", "import json, urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)); assert d['pii_gpu_ready'] and d['gemma_ready'] and d['glm_ready'], d"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4)"]
       interval: "15s"
       timeout: "5s"
       retries: 10
-      # 10 min grace covers the image/model mount, E2B BF16 weight load,
-      # CUDA graph compile, and GLM startup. Once the grace expires, every
-      # served workload must be ready before Tinfoil can promote the candidate.
-      start_period: "600s"
-
-  - name: glm-5-3-flash
-    # v0.9.1 layers the Pi-compatible replay template onto the exact tested
-    # v0.9.0 llama.cpp runtime; model code and weights are otherwise unchanged.
-    image: "ghcr.io/screenpipe/privacy-filter:glm-0.9.1@sha256:b2a54e7b62a5fbfcabceba7a63fff7774de5a47157add07a04352124658c1fbf"
-    runtime: nvidia
-    gpus: all
-    restart: "always"
-    networks: ["models"]
-    command:
-      - "--model"
-      - "/tinfoil/mpk/mpk-260fbbbd8ad74cb2ec338e65fd4d3b4afd0cee508c2455886882f2813ca93ad0/GLM-5.3-Flash-REAP50-IQ3_M.gguf"
-      - "--alias"
-      - "glm-5.3-flash-reap50-iq3m"
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8002"
-      - "--ctx-size"
-      # llama.cpp divides the total context across slots. Keep the full 32k
-      # Screenpipe window per request while allowing a second request to start
-      # immediately instead of queueing behind a long Day Recap generation.
-      - "65536"
-      - "--n-gpu-layers"
-      - "999"
-      - "--parallel"
-      - "2"
-      - "--flash-attn"
-      - "on"
-      # Test wider CUDA prefill batches for long Screenpipe prompts. The
-      # defaults are 2048/512; staging must pass the VRAM and latency gates.
-      - "--batch-size"
-      - "4096"
-      - "--ubatch-size"
-      - "1024"
-      - "--cache-type-k"
-      - "q8_0"
-      - "--cache-type-v"
-      - "q8_0"
-      - "--cache-ram"
-      - "512"
-      # GLM's summaries and tool payloads repeat short spans. ngram-mod drafts
-      # those repetitions without loading a second model; the target still
-      # verifies every accepted token. A 16-token match avoids the poor-quality
-      # range warned about by llama.cpp while 4–32 token drafts cover brief
-      # filenames, UI labels, and tool-result fragments.
-      - "--spec-type"
-      - "ngram-mod"
-      - "--spec-ngram-size-n"
-      - "16"
-      - "--draft-min"
-      - "4"
-      - "--draft-max"
-      - "32"
-      # Export aggregate timing/slot counters on the enclave-private server so
-      # staged benchmarks can separate queue, prefill, and decode latency.
-      - "--metrics"
-      - "--slots"
-      - "--perf"
-      - "--jinja"
-      - "--chat-template-file"
-      - "/app/glm-chat-template.jinja"
-      - "--override-kv"
-      - "tokenizer.ggml.eot_token_id=int:154827"
-      - "--override-kv"
-      - "tokenizer.ggml.eom_token_id=int:154829"
-    tmpfs:
-      /tmp: size=2g,mode=1777,exec
-      /root: size=2g,mode=0700,exec
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8002/health"]
-      interval: "30s"
-      timeout: "10s"
-      retries: 10
-      start_period: "3600s"
+      start_period: "120s"
 
 shim:
   upstream-port: 8080
-  # Gemma's /v1 endpoints retain the existing Tinfoil control-plane key check.
-  # GLM uses GLM_API_KEY inside the privacy-filter router because custom
-  # Containers are unrelated to Tinfoil's managed inference subscription.
-  # /filter, /image/detect, and /health stay unauthenticated for the existing
-  # screenpipe-redact clients — same posture as v0.3.x.
-  authenticated: true
-  authenticated-endpoints:
-    - /v1/chat/completions
-    - /v1/responses
-  # Any path not listed is rejected with 404 at the shim — no debug or
-  # introspection leaks. /v1/* surface is for Gemma E4B chat / audio /
-  # vision; everything else mirrors v0.3.x.
+  # Same public PII routes as before; no chat or model proxy routes.
+  authenticated: false
   paths:
     - /health
     - /filter
     - /image/detect
-    - /v1/chat/completions
-    - /v1/models
-    - /v1/responses
-    - /glm/v1/chat/completions
-    - /glm/v1/completions
-    - /glm/v1/models
-    - /metrics

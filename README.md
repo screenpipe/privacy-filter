@@ -3,22 +3,20 @@
 
 # privacy-filter
 
-GPU-backed HTTP wrapper around two PII models plus co-hosted Gemma and GLM chat models in one Tinfoil enclave:
+CPU-only HTTP service for two PII models in a Tinfoil confidential-compute enclave:
 
-1. [`screenpipe/pii-redactor`](https://huggingface.co/screenpipe/pii-redactor) (`v50_distilled6l`) — six-layer, vocab-pruned XLM-R token classifier for **text PII**. Endpoint `POST /filter`.
-2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v38`) — RF-DETR-Nano detector for **image PII** in screenshots. Large desktop frames use the same whole-frame + four-tile policy as the desktop app. Endpoint `POST /image/detect`.
-3. [`google/gemma-4-E2B-it`](https://huggingface.co/google/gemma-4-E2B-it) — chat + vision + **audio** via vLLM. Endpoint `POST /v1/chat/completions` with the backwards-compatible API model id `"gemma4-e4b"`. Weights are baked into the image (~10 GB BF16).
-4. [`patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF`](https://huggingface.co/patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF) — 50%-expert-pruned GLM-5.3-Flash, served from the 67.2 GiB `IQ3_M` quant by a pinned CUDA `llama-server`. Endpoint `POST /glm/v1/chat/completions`.
+1. [`screenpipe/pii-redactor`](https://huggingface.co/screenpipe/pii-redactor) (`v50_distilled6l`), the same hash-verified text checkpoint and vocabulary remap as the desktop app. Endpoint `POST /filter`.
+2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v38`), with the existing whole-frame plus four-tile screenshot policy. Endpoint `POST /image/detect`.
 
-> **Note:** the 31B model (`gemma4-31b`) is **not** in this container. It stays on Tinfoil's hosted `inference.tinfoil.sh` endpoint, reached separately by `packages/ai-gateway` in the Cloudflare worker. The co-hosted E2B is a smaller multimodal-audio model, not a drop-in replacement.
+`tinfoil-config.yml` provisions 8 vCPUs, 16 GB RAM, and no GPU. `Dockerfile.cpu` includes ONNX Runtime CPU and neither generative-model weights nor CUDA. `PRIVACY_ONLY=true` skips both chat upstreams and makes readiness require both privacy models on CPU. The public shim exposes only the existing PII endpoints and health. Previously hosted Gemma and GLM routes are retired.
 
-All four workloads deploy inside the same [Tinfoil](https://tinfoil.sh) confidential-compute enclave on one H200 (~141 GB VRAM) so neither pixels, text, nor chat prompts leave an attested runtime. The existing `privacy-filter` container remains the only public router: `/v1/*` goes to Gemma over loopback and `/glm/v1/*` goes to the isolated GLM sibling over an enclave-only bridge. One TLS-attested URL, one auth token, four workloads sharing one allocation.
+The legacy GPU `Dockerfile`, entrypoint and release history remain available for rollback; their sizing notes below are historical.
 
 ## API
 
 ```
 GET  /health         → {"status": "ok", "model_ready": true, "image_model_ready": true,
-                           "pii_gpu_ready": true, "text_provider": "CUDAExecutionProvider", ...}
+                           "pii_gpu_ready": false, "text_provider": "CPUExecutionProvider", ...}
 
 POST /filter         → {"text": "My email is alice@foo.com"}
                     ←  {"redacted": "My email is [EMAIL]",
@@ -33,10 +31,6 @@ POST /image/detect   → {"image_b64": "<b64-jpg-or-png>", "threshold": 0.30}
                         "latency_ms": 95, "model": "rfdetr_v38",
                         "width": 2880, "height": 1800}
 
-POST /glm/v1/chat/completions
-                    → {"model": "glm-5.3-flash-reap50-iq3m",
-                       "messages": [{"role": "user", "content": "Hello"}]}
-                    ← OpenAI-compatible chat-completion response
 ```
 
 Bbox is `[x, y, w, h]` in original-image pixel space (the server un-resizes from the model's 512×512 input). Labels are the canonical 12-class screenpipe PII taxonomy.
@@ -45,7 +39,7 @@ Bbox is `[x, y, w, h]` in original-image pixel space (the server un-resizes from
 
 ```bash
 # build
-docker build -t privacy-filter:dev .
+docker build -f Dockerfile.cpu -t privacy-filter:dev .
 
 # run
 docker run --rm -p 8080:8080 privacy-filter:dev
@@ -63,19 +57,16 @@ curl -s -X POST http://localhost:8080/image/detect \
      -d "$(jq -nc --arg img "$B64" '{image_b64: $img, threshold: 0.30}')" | jq
 ```
 
-The first build downloads the v50 text contract (~133 MB across model, tokenizer, config, and vocabulary remap), the 60 MB rfdetr_v38 ONNX, and the baked Gemma weights. Subsequent builds use the build cache. Both HuggingFace revisions and every model artifact checksum are pinned, so a rebuild cannot silently drift to different weights.
+The first build downloads the v50 text contract (~133 MB across model, tokenizer, config, and vocabulary remap), the 60 MB rfdetr_v38 ONNX. Subsequent builds use the build cache. Both HuggingFace revisions and every model artifact checksum are pinned, so a rebuild cannot silently drift to different weights.
 
 ## Deploy to Tinfoil
 
 1. **Build and push the image to GitHub Container Registry** using the
    `privacy-filter release` workflow. Supply the semantic version without
-   the `v` prefix (for example `0.9.0`). The workflow prints the immutable
-   router image digest. Build the GLM runtime with its separate workflow; it
-   publishes under the existing public `privacy-filter` package.
+   the `v` prefix (for example `0.10.0-cpu.rc1`) and select `cpu_only=true`. The workflow prints the immutable CPU image digest. The build runs actual text and image inference before uploading.
 
    ```bash
-   gh workflow run release.yml --ref <branch> -f version=0.9.0
-   gh workflow run glm-runtime.yml --ref <branch> -f version=0.9.0
+   gh workflow run release.yml --ref <branch> -f version=0.10.0-cpu.rc1 -f cpu_only=true
    ```
 
 2. **Pin the digest** in `tinfoil-config.yml`, commit it, then create the
@@ -83,8 +74,8 @@ The first build downloads the v50 text contract (~133 MB across model, tokenizer
 
    ```bash
    git add tinfoil-config.yml
-   git commit -m "release: privacy-filter v0.9.0"
-   git tag v0.9.0 && git push origin <branch> v0.9.0
+   git commit -m "release: CPU privacy-filter v0.10.0-cpu.rc1"
+   git tag v0.10.0-cpu.rc1 && git push origin <branch> v0.10.0-cpu.rc1
    ```
 
 3. **Update the existing deployment** through Tinfoil's blue-green update
@@ -110,7 +101,7 @@ The first build downloads the v50 text contract (~133 MB across model, tokenizer
    `python3 scripts/reconcile_tinfoil_release.py` after building
    `tools/tinfoil-release-check`; `--apply` is reserved for the workflow.
 
-## Resource sizing (GPU)
+## Historical resource sizing (legacy GPU image)
 
 **Text model (`v50_distilled6l`) — mixed int4/int8 ONNX:**
 

@@ -1,0 +1,12 @@
+# screenpipe — AI that knows everything you've seen, said, or heard
+# https://screenpipe.com
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+httpx==0.27.2
+huggingface_hub==0.26.2
+transformers==4.46.3
+tokenizers==0.20.3
+onnxruntime==1.23.2
+pillow==11.0.0
+numpy==2.1.3
