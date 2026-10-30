@@ -17,41 +17,22 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-      # Preserve measure-image-action v0.8.2's pinned measurement container
-      # and signing steps. Its release wrapper cannot create prereleases, so
-      # create the candidate here instead of briefly changing clients' latest.
-      - name: Create deployment manifest
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Prepare artifact mount
         run: |
           mkdir -p output
-          # The measured container runs with all capabilities dropped, including
-          # DAC_OVERRIDE. Permit writes only to its dedicated artifact mount.
+          # The official measurer drops DAC_OVERRIDE. Only its artifact mount
+          # needs to accept writes from the restricted container user.
           chmod 0777 output
-          docker run --rm --cap-drop=ALL --security-opt=no-new-privileges \
-            --read-only --tmpfs /tmp --tmpfs /cache --tmpfs /root/.cache \
-            -v "$PWD/output:/output" -v "$PWD/tinfoil-config.yml:/config.yml:ro" \
-            -e GH_TOKEN \
-            ghcr.io/tinfoilsh/measure-image-action@sha256:0a74ae61c10be76f4e4459f3ca2db26563db8618fc55680d6acbb9b82be055a9
-          sudo chown -R "$(id -u):$(id -g)" output
-      - name: Hash deployment manifest
-        id: hash
-        run: |
-          digest=$(sha256sum output/tinfoil-deployment.json | cut -d ' ' -f 1)
-          printf '%s\n' "$digest" > output/tinfoil.hash
-          printf 'digest=sha256:%s\n' "$digest" >> "$GITHUB_OUTPUT"
-      - name: Attest
-        uses: actions/attest@7667f588f2f73a90cea6c7ac70e78266c4f76616 # v3.1.0
+      # Tinfoil's control plane validates this official action invocation.
+      # Pin the same v0.8.2 measurement implementation used for this CVM.
+      - name: Measure, attest, and create candidate
+        uses: tinfoilsh/measure-image-action@9733d724326dd6b476335ec513210861894d4cb2 # v0.8.2
         with:
-          subject-name: tinfoil-deployment.json
-          subject-digest: ${{ steps.hash.outputs.digest }}
-          predicate-type: https://tinfoil.sh/predicate/snp-tdx-multiplatform/v1
-          predicate-path: output/tinfoil-deployment.json
-      - name: Create candidate release
+          config-file: ${{ github.workspace }}/tinfoil-config.yml
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mark-as-latest: "false"
+      - name: Keep candidate out of production release selection
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REF: ${{ github.ref_name }}
-        run: |
-          gh release create "$RELEASE_REF" --verify-tag --prerelease --latest=false \
-            --title "$RELEASE_REF" --notes-file output/release.md \
-            output/tinfoil-deployment.json output/tinfoil.hash
+        run: gh release edit "$RELEASE_REF" --prerelease
