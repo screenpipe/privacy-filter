@@ -25,6 +25,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p output
+          # The measured container runs with all capabilities dropped, including
+          # DAC_OVERRIDE. Permit writes only to its dedicated artifact mount.
+          chmod 0777 output
           docker run --rm --cap-drop=ALL --security-opt=no-new-privileges \
             --read-only --tmpfs /tmp --tmpfs /cache --tmpfs /root/.cache \
             -v "$PWD/output:/output" -v "$PWD/tinfoil-config.yml:/config.yml:ro" \
