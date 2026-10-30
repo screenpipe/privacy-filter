@@ -50,6 +50,7 @@ jobs:
       # ("No space left on device"). Reclaim ~30 GB of preinstalled
       # toolchains we don't use before building.
       - name: Free disk space
+        if: ${{ !inputs.cpu_only }}
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true

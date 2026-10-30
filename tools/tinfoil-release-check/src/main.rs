@@ -24,15 +24,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tinfoil::Client::new(HOST, REPO, "").await?;
             println!("Latest selection, source provenance, hardware and TLS verified");
         }
-        Some("verify") if args.len() == 3 => {
+        Some("verify") if args.len() == 3 || args.len() == 4 => {
+            let host = args.get(3).map(String::as_str).unwrap_or(HOST);
             // The caller first authenticates this file with gh attestation verify,
             // checking the exact repository, workflow/tag identity and digest.
             // A pinned client alone does NOT prove source provenance.
             let manifest: Value = serde_json::from_slice(&std::fs::read(&args[2])?)?;
             let measurement = manifest_measurement(&manifest)?;
-            let mut client = tinfoil::SecureClient::with_measurement(HOST, "", measurement);
+            let mut client = tinfoil::SecureClient::with_measurement(host, "", measurement);
             client.verify().await?; // AMD chain, register equality, TLS/HPKE/report binding.
-            let response = client.http_client()?.post(format!("https://{HOST}/filter"))
+            let response = client.http_client()?.post(format!("https://{host}/filter"))
                 .json(&json!({"text": "The weather is sunny. Contact alice@example.com.", "include_spans": false}))
                 .send().await?.error_for_status()?;
             let body: Value = response.json().await?;
@@ -44,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "usage: tinfoil-release-check inspect | latest | newer <current-tag> <candidate-tag> | verify <verified-manifest.json>"
+                "usage: tinfoil-release-check inspect | latest | newer <current-tag> <candidate-tag> | verify <verified-manifest.json> [review-host]"
                     .into(),
             )
         }
