@@ -8,7 +8,7 @@ gpus: 0
 
 containers:
   - name: privacy-filter
-    image: "ghcr.io/screenpipe/privacy-filter:0.10.0-cpu.rc1@sha256:c303fb570ee5f3e1af88bc7ee54101979fdaac020855bbe7c490b5e30a43933f"
+    image: "ghcr.io/screenpipe/privacy-filter:0.11.0-cpu.rc1@sha256:245542e2c87639b0464ff3c55b12a16198d2b131d4d46c16ec45a1239736d5df"
     user: "10001:999"
     env:
       - PORT: "8080"
