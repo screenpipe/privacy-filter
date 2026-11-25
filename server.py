@@ -124,14 +124,13 @@ _HOP_BY_HOP_HEADERS = frozenset([
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
 ])
 
-# ── Image-PII detector (rfdetr_v38, real-screen validated, fp16) ───────
-# Path to the ONNX. Baked in by the Dockerfile from
-# huggingface.co/screenpipe/pii-image-redactor.
-IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v38.onnx")
-IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v38")
+# ── Image-PII V4 detector (rfdetr_v108b 768px W16A32 + pii_role_fusion_v4) ──
+# Baked into the enclave image with pinned revision and SHA-256 checksums.
+IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v108b.onnx")
+IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v108b")
 # Optional V4 OS-accessibility role/context fusion head (~2.1 MB ONNX, ~1.4 ms CPU).
-ROLE_MODEL_PATH = os.environ.get("ROLE_MODEL_PATH", "/opt/pii_role_fusion_v4_8.onnx")
-ROLE_MODEL_ID = os.environ.get("ROLE_MODEL_ID", "pii_role_fusion_v4_8")
+ROLE_MODEL_PATH = os.environ.get("ROLE_MODEL_PATH", "/opt/pii_role_fusion_v4.onnx")
+ROLE_MODEL_ID = os.environ.get("ROLE_MODEL_ID", "pii_role_fusion_v4")
 MAX_AX_NODES = int(os.environ.get("MAX_AX_NODES", "1024"))
 # Bound concurrent /image/detect workers so burst screenshot traffic cannot
 # oversubscribe CPU threads in the 8-vCPU Tinfoil enclave (2 * 4 ORT threads = 8)

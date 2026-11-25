@@ -126,9 +126,15 @@ class RoleFusionAndConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("private_email", labels)
 
     async def test_role_fusion_onnx_vetoes_nav_chrome_id_and_keeps_body_email(self) -> None:
-        role_model_candidate = "/Users/louis/pii-v4-flywheel/models/pii_role_fusion_v4_8.onnx"
-        if not os.path.exists(role_model_candidate):
-            self.skipTest("local pii_role_fusion_v4_8.onnx not present")
+        candidates = [
+            server.ROLE_MODEL_PATH,
+            "/Users/louis/pii-v4-flywheel/models/pii_role_fusion_v4_15.onnx",
+            "/Users/louis/pii-v4-flywheel/models/pii_role_fusion_v4_14.onnx",
+            "/Users/louis/pii-v4-flywheel/models/pii_role_fusion_v4_8.onnx",
+        ]
+        role_model_candidate = next((p for p in candidates if p and os.path.exists(p)), None)
+        if not role_model_candidate:
+            self.skipTest("no role_fusion_v4 onnx present")
         import onnxruntime as ort
 
         role_sess = ort.InferenceSession(role_model_candidate, providers=["CPUExecutionProvider"])

@@ -5,6 +5,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import time
 
 import httpx
@@ -23,6 +24,11 @@ async def main():
             assert health.status_code == 200, health.text
             assert health.json()["text_provider"] == "CPUExecutionProvider"
             assert health.json()["image_provider"] == "CPUExecutionProvider"
+            pub_health = await client.get("/health")
+            assert pub_health.status_code == 200, pub_health.text
+            assert pub_health.json()["image_model_ready"] is True, pub_health.text
+            if server.ROLE_MODEL_PATH and os.path.exists(server.ROLE_MODEL_PATH):
+                assert pub_health.json()["role_model_ready"] is True, pub_health.text
             timings = {}
             text = "Contact Alice Smith at alice.smith@example.com or 415-555-0123."
             for _ in range(3):
