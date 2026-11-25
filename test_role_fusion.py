@@ -33,7 +33,11 @@ class FakeInput:
 
 
 class FakeVisionSession:
-    """Deterministic stub emitting one table-header ID FP and one body email."""
+    """Deterministic stub emitting one table-header ID FP and one body email on the whole-frame pass."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._calls = 0
 
     def get_inputs(self):
         return [FakeInput()]
@@ -42,14 +46,18 @@ class FakeVisionSession:
         return ["CPUExecutionProvider"]
 
     def run(self, _out, _feed):
+        with self._lock:
+            call_idx = self._calls
+            self._calls += 1
         boxes = np.zeros((1, 300, 4), dtype=np.float32)
         logits = np.full((1, 300, 13), -8.0, dtype=np.float32)
-        # Query 0: ambiguous `id` in top navigation/table chrome (score ~0.46)
-        boxes[0, 0] = [0.12, 0.04, 0.06, 0.025]
-        logits[0, 0, 9] = -0.15  # sigmoid(-0.15) = 0.4626
-        # Query 1: high-confidence `email` in main article body (score ~0.92)
-        boxes[0, 1] = [0.45, 0.42, 0.16, 0.024]
-        logits[0, 1, 1] = 2.45  # sigmoid(2.45) = 0.9206
+        if call_idx == 0:
+            # Query 0: ambiguous `id` in top navigation/table chrome (score ~0.46)
+            boxes[0, 0] = [0.12, 0.04, 0.06, 0.025]
+            logits[0, 0, 9] = -0.15  # sigmoid(-0.15) = 0.4626
+            # Query 1: high-confidence `email` in main article body (score ~0.92)
+            boxes[0, 1] = [0.45, 0.42, 0.16, 0.024]
+            logits[0, 1, 1] = 2.45  # sigmoid(2.45) = 0.9206
         return [boxes, logits]
 
 

@@ -1228,7 +1228,11 @@ def _image_inference_windows(width: int, height: int) -> List[Tuple[int, int, in
     of the detector's trained scale band.
     """
     windows = [(0, 0, width, height)]
-    big = width >= IMAGE_INPUT_SIZE * 2 and height >= IMAGE_INPUT_SIZE * 3 // 2
+    # Keep the >= 1024x768 desktop tiling threshold even when IMAGE_INPUT_SIZE
+    # increases to 640/768 so 1440x900, 1512x982, and 1920x1080 captures retain
+    # 2x2 quadrant magnification (matching gen_preds.py and rfdetr.rs).
+    tile_base = min(IMAGE_INPUT_SIZE, 512)
+    big = width >= tile_base * 2 and height >= tile_base * 3 // 2
     if not IMAGE_TILED_INFERENCE or not big:
         return windows
 
