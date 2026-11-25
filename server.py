@@ -43,19 +43,22 @@ Design choices:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hmac
 import json
 import logging
 import os
 import re
 import time
-from typing import List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoTokenizer
+
+import role_fusion
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
@@ -102,6 +105,8 @@ def _ort_options(ort):
     if PRIVACY_ONLY:
         opts.intra_op_num_threads = int(os.environ.get("ORT_NUM_THREADS", "4"))
         opts.inter_op_num_threads = 1
+        if hasattr(ort, "ExecutionMode"):
+            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     return opts
 
 
@@ -124,6 +129,17 @@ _HOP_BY_HOP_HEADERS = frozenset([
 # huggingface.co/screenpipe/pii-image-redactor.
 IMAGE_MODEL_PATH = os.environ.get("IMAGE_MODEL_PATH", "/opt/rfdetr_v38.onnx")
 IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "rfdetr_v38")
+# Optional V4 OS-accessibility role/context fusion head (~2.1 MB ONNX, ~1.4 ms CPU).
+ROLE_MODEL_PATH = os.environ.get("ROLE_MODEL_PATH", "/opt/pii_role_fusion_v4_8.onnx")
+ROLE_MODEL_ID = os.environ.get("ROLE_MODEL_ID", "pii_role_fusion_v4_8")
+MAX_AX_NODES = int(os.environ.get("MAX_AX_NODES", "1024"))
+# Bound concurrent /image/detect workers so burst screenshot traffic cannot
+# oversubscribe CPU threads in the 8-vCPU Tinfoil enclave (2 * 4 ORT threads = 8)
+# or starve the /filter text batcher's executor.
+IMAGE_MAX_CONCURRENCY = max(
+    1,
+    int(os.environ.get("IMAGE_MAX_CONCURRENCY", "2" if PRIVACY_ONLY else "4")),
+)
 # Reject images larger than this (decoded). Defends against an
 # adversarial 100-MB JPEG of a 50K×50K canvas blowing up enclave RAM.
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", "20000000"))  # 20 MB
@@ -277,6 +293,37 @@ class FilterResponse(BaseModel):
     model: str
 
 
+class AxBounds(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    left: float = 0.0
+    top: float = 0.0
+    width: float = 0.0
+    height: float = 0.0
+
+
+class AxNode(BaseModel):
+    """Strictly text-free accessibility node contract for V4 role/context fusion.
+
+    Raw text/value/placeholder strings are intentionally omitted and ignored so
+    zero user text ever crosses `/image/detect`.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    role: str = "AXGroup"
+    subrole: Optional[str] = None
+    landmark: Optional[str] = None
+    depth: int = 0
+    parent_idx: Optional[int] = None
+    bounds: Optional[AxBounds] = None
+    on_screen: Optional[bool] = None
+    is_editable: bool = False
+    is_focused: bool = False
+    is_selected: bool = False
+    is_password: bool = False
+    is_keyboard_focusable: bool = False
+    has_cred_hint: bool = False
+
+
 class DetectRequest(BaseModel):
     image_b64: str = Field(..., description="Base64-encoded JPEG/PNG bytes.")
     threshold: float = Field(
@@ -288,6 +335,11 @@ class DetectRequest(BaseModel):
     labels: Optional[List[str]] = Field(
         None,
         description="Canonical SpanLabel names to return; absent = all detected classes.",
+    )
+    ax_nodes: Optional[List[AxNode]] = Field(
+        None,
+        max_length=MAX_AX_NODES,
+        description="Optional text-free accessibility tree nodes for V4 role/context fusion.",
     )
 
 
@@ -326,8 +378,27 @@ _id2label = None
 # embedding table contains only retained rows. Missing ids map to unk_new.
 _token_id_remap = None
 _token_id_unk = 0
-# rfdetr_v38 ONNX session — loaded alongside the text model at startup.
+# rfdetr ONNX session — loaded alongside the text model at startup.
 _image_session = None
+# Optional V4 OS-accessibility role/context fusion ONNX session (~2.1 MB).
+_role_session = None
+# Bounded worker pool for /image/detect so CPU threads never oversubscribe.
+_image_executor: "concurrent.futures.ThreadPoolExecutor | None" = None
+_image_executor_workers: int = 0
+
+
+def _get_image_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _image_executor, _image_executor_workers
+    wanted = max(1, int(IMAGE_MAX_CONCURRENCY))
+    if _image_executor is None or _image_executor_workers != wanted:
+        if _image_executor is not None:
+            _image_executor.shutdown(wait=False)
+        _image_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=wanted,
+            thread_name_prefix="image-pii",
+        )
+        _image_executor_workers = wanted
+    return _image_executor
 
 # Dynamic-batching state. Initialized in the startup hook so the queue
 # is bound to FastAPI's running event loop.
@@ -528,6 +599,74 @@ def _load_image_model() -> None:
         # keep serving than fail boot. The first real request will eat
         # whatever build cost remains.
         log.warning("image model warmup failed (will retry on first request): %s", e)
+
+
+@app.on_event("startup")
+def _load_role_model() -> None:
+    """Load the optional V4 accessibility role/context fusion ONNX session.
+
+    Runs strictly on CPU (`intra_op_num_threads=1`, ~1.4 ms per frame for the
+    2.1 MB Transformer) so it works identically in CPU-only Tinfoil enclaves
+    and GPU deployments without touching CUDA memory or stealing ORT threads.
+    """
+    global _role_session
+    _get_image_executor()
+    if not ROLE_MODEL_PATH or not os.path.exists(ROLE_MODEL_PATH):
+        log.info(
+            "role fusion model not present at %s — /image/detect will use pure vision "
+            "(plus deterministic password-field bounds when ax_nodes are supplied)",
+            ROLE_MODEL_PATH,
+        )
+        return
+    t0 = time.time()
+    import numpy as np
+    import onnxruntime as ort
+
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    if hasattr(ort, "ExecutionMode"):
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    _role_session = ort.InferenceSession(
+        ROLE_MODEL_PATH,
+        sess_options=opts,
+        providers=["CPUExecutionProvider"],
+    )
+    try:
+        _role_session.run(
+            ["keep_prob", "epistemic_std", "box_delta"],
+            {
+                "box_feats": np.zeros(
+                    (1, role_fusion.MAX_PROPOSALS, role_fusion.BOX_FEAT_DIM_V46),
+                    dtype=np.float32,
+                ),
+                "node_feats": np.zeros(
+                    (1, role_fusion.MAX_NODES, role_fusion.NODE_FEAT_DIM),
+                    dtype=np.float32,
+                ),
+                "rel_feats": np.zeros(
+                    (1, role_fusion.MAX_PROPOSALS, role_fusion.MAX_NODES, role_fusion.REL_FEAT_DIM),
+                    dtype=np.float32,
+                ),
+            },
+        )
+    except Exception as e:
+        log.warning("role fusion warmup failed: %s", e)
+    log.info(
+        "role fusion model loaded in %.2fs from %s",
+        time.time() - t0,
+        ROLE_MODEL_PATH,
+    )
+
+
+@app.on_event("shutdown")
+def _close_image_executor() -> None:
+    global _image_executor, _image_executor_workers
+    if _image_executor is not None:
+        _image_executor.shutdown(wait=False)
+        _image_executor = None
+        _image_executor_workers = 0
 
 
 @app.on_event("startup")
@@ -810,6 +949,9 @@ async def health() -> dict:
         "model": MODEL_ID,
         "image_model_ready": _image_session is not None,
         "image_model": IMAGE_MODEL_ID,
+        "role_model_ready": _role_session is not None,
+        "role_model": ROLE_MODEL_ID if _role_session is not None else None,
+        "image_max_concurrency": IMAGE_MAX_CONCURRENCY,
         **_pii_gpu_state(),
         "gemma_ready": gemma_ready,
         "gemma_model": "gemma4-e4b",
@@ -960,25 +1102,25 @@ async def filter_pii(req: FilterRequest) -> FilterResponse:
 
 
 @app.post("/image/detect", response_model=DetectResponse)
-def image_detect(req: DetectRequest) -> DetectResponse:
+async def image_detect(req: DetectRequest) -> DetectResponse:
     """Detect PII regions in a screenshot.
 
     Wire format mirrors the existing /filter endpoint — Bearer-auth
     is handled at the Tinfoil edge, not here. Same client-side adapter
     pattern as `tinfoil` text adapter (see screenpipe-redact's
     `adapters/tinfoil_image.rs`).
+
+    Runs inside `_get_image_executor()` (`max_workers = IMAGE_MAX_CONCURRENCY`,
+    default 2 on CPU-only Tinfoil `cpus: 8 / ORT_NUM_THREADS: 4`) so concurrent
+    screenshot requests queue cleanly without oversubscribing vCPUs or starving
+    `/filter` text redaction.
     """
     if _image_session is None:
         raise HTTPException(status_code=503, detail="image model not loaded")
 
     import base64
-    import io
-    import numpy as np
-    from PIL import Image
 
-    # Reject oversized payloads BEFORE decoding — base64 inflates by 33%
-    # so the raw size limit on the b64 string covers the decoded size
-    # plus a safety margin.
+    # Reject oversized payloads BEFORE decoding or entering the CPU worker pool.
     if len(req.image_b64) > MAX_IMAGE_BYTES * 4 // 3:
         raise HTTPException(
             status_code=413,
@@ -993,6 +1135,18 @@ def image_detect(req: DetectRequest) -> DetectResponse:
             status_code=413,
             detail=f"decoded image exceeds {MAX_IMAGE_BYTES} bytes",
         )
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _get_image_executor(), _detect_image_bytes, raw, req
+    )
+
+
+def _detect_image_bytes(raw: bytes, req: DetectRequest) -> DetectResponse:
+    import io
+    import numpy as np
+    from PIL import Image
+
     try:
         img = Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception as e:
@@ -1001,23 +1155,66 @@ def image_detect(req: DetectRequest) -> DetectResponse:
     # Per-field allow-list (canonical SpanLabel names). None = return all.
     allowed = _resolve_allowed_labels(req.labels)
     orig_w, orig_h = img.size
+    has_ax = bool(req.ax_nodes)
     t0 = time.time()
-    detections: List[ImageDetection] = []
+
     try:
-        for window in _image_inference_windows(orig_w, orig_h):
-            detections.extend(
-                _infer_image_window(img, window, req.threshold, allowed, np, Image)
+        if has_ax:
+            prop_floor = min(float(req.threshold), role_fusion.ROLE_PROPOSAL_FLOOR)
+            raw_props: List[Dict[str, Any]] = []
+            for window in _image_inference_windows(orig_w, orig_h):
+                raw_props.extend(
+                    _infer_image_proposals(img, window, prop_floor, np, Image)
+                )
+            nms_props = _suppress_raw_proposals(raw_props)
+            ax_dicts = [n.model_dump(exclude_none=True) for n in (req.ax_nodes or [])]
+            fused = role_fusion.fuse_proposals_with_ax(
+                nms_props,
+                ax_dicts,
+                orig_w,
+                orig_h,
+                role_session=_role_session,
             )
+            detections = []
+            for r in fused:
+                score = float(r["score"])
+                if score < req.threshold:
+                    continue
+                lbl = str(r["label"])
+                model_lbl = CANONICAL_TO_MODEL.get(lbl.lower(), lbl)
+                if allowed is not None and model_lbl not in allowed:
+                    continue
+                detections.append(
+                    ImageDetection(
+                        bbox=[int(v) for v in r["bbox"]],
+                        label=model_lbl,
+                        score=score,
+                    )
+                )
+            detections = _suppress_image_overlaps(detections)
+        else:
+            detections = []
+            for window in _image_inference_windows(orig_w, orig_h):
+                detections.extend(
+                    _infer_image_window(img, window, req.threshold, allowed, np, Image)
+                )
+            detections = _suppress_image_overlaps(detections)
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception("image inference failed")
         raise HTTPException(status_code=500, detail=f"image inference error: {e}")
-    detections = _suppress_image_overlaps(detections)
-    latency_ms = int((time.time() - t0) * 1000)
 
+    latency_ms = int((time.time() - t0) * 1000)
+    model_used = (
+        f"{IMAGE_MODEL_ID}+{ROLE_MODEL_ID}"
+        if (has_ax and _role_session is not None)
+        else IMAGE_MODEL_ID
+    )
     return DetectResponse(
         detections=detections,
         latency_ms=latency_ms,
-        model=IMAGE_MODEL_ID,
+        model=model_used,
         width=orig_w,
         height=orig_h,
     )
@@ -1046,6 +1243,70 @@ def _image_inference_windows(width: int, height: int) -> List[Tuple[int, int, in
             if x1 > x0 and y1 > y0:
                 windows.append((x0, y0, x1 - x0, y1 - y0))
     return windows
+
+
+def _infer_image_proposals(
+    image,
+    window: Tuple[int, int, int, int],
+    floor: float,
+    np,
+    Image,
+) -> List[Dict[str, Any]]:
+    """Run one RF-DETR pass and return full-frame proposals including 12-class `probs12`."""
+    offset_x, offset_y, window_w, window_h = window
+    if window == (0, 0, image.width, image.height):
+        source = image
+    else:
+        source = image.crop(
+            (offset_x, offset_y, offset_x + window_w, offset_y + window_h)
+        )
+    resized = source.resize((IMAGE_INPUT_SIZE, IMAGE_INPUT_SIZE), Image.BILINEAR)
+
+    arr = np.asarray(resized, dtype=np.float32) / 255.0
+    arr = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array(
+        [0.229, 0.224, 0.225], dtype=np.float32
+    )
+    arr = arr.transpose(2, 0, 1)[None].astype(np.float32)
+    boxes, logits = _image_session.run(
+        None, {_image_session.get_inputs()[0].name: arr}
+    )
+    boxes, logits = boxes[0], logits[0]
+
+    probs = 1.0 / (
+        1.0 + np.exp(-np.clip(logits[:, : len(IMAGE_CLASSES)], -30.0, 30.0))
+    )
+    best_class = probs.argmax(axis=1)
+    best_score = probs[np.arange(len(probs)), best_class]
+    proposals: List[Dict[str, Any]] = []
+    for query in np.where(best_score >= floor)[0]:
+        cx, cy, box_w, box_h = boxes[query]
+        x1 = max(0.0, (cx - box_w / 2.0) * window_w) + offset_x
+        y1 = max(0.0, (cy - box_h / 2.0) * window_h) + offset_y
+        x2 = min(float(image.width), (cx + box_w / 2.0) * window_w + offset_x)
+        y2 = min(float(image.height), (cy + box_h / 2.0) * window_h + offset_y)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        proposals.append(
+            {
+                "bbox": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
+                "label": IMAGE_CLASSES[int(best_class[query])],
+                "score": float(best_score[query]),
+                "probs12": [float(v) for v in probs[query]],
+            }
+        )
+    return proposals
+
+
+def _suppress_raw_proposals(proposals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    kept: List[Dict[str, Any]] = []
+    for prop in sorted(proposals, key=lambda item: -float(item["score"])):
+        if any(
+            role_fusion.iou_xywh(existing["bbox"], prop["bbox"]) >= IMAGE_TILE_NMS_IOU
+            for existing in kept
+        ):
+            continue
+        kept.append(prop)
+    return kept
 
 
 def _infer_image_window(

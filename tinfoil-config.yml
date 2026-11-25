@@ -15,6 +15,7 @@ containers:
       - HOME: "/home/appuser"
       - PRIVACY_ONLY: "true"
       - ORT_NUM_THREADS: "4"
+      - IMAGE_MAX_CONCURRENCY: "2"
     tmpfs:
       /tmp: size=256m,mode=1777
       /home/appuser: size=64m,mode=0700,uid=10001,gid=999
