@@ -16,19 +16,25 @@ import server
 
 def main() -> None:
     server._load_model()
-    pii, clean, long_tail = server._opf_on_batch(
+    pii, clean, long_tail, bare_secret, sensitive = server._opf_on_batch(
         [
             "Contact alice@example.com about the incident.",
             "Arc | Claude | GitHub | localhost:3030",
-            ("line\n" * 300) + "alice@example.com",
+            ("line\n" * 300) + "Contact alice@example.com about the incident.",
+            "ghp_A9b8C7d6E5f4G3h2I1j0K9l8M7n6O5p4Q3r2",
+            "Patient Marcus Chen was diagnosed with Crohn's disease.",
         ]
     )
     if not any(span["entity_group"] == "private_email" for span in pii):
-        raise RuntimeError("v50 smoke: expected email detection was missing")
+        raise RuntimeError("text smoke: expected email detection was missing")
     if clean:
-        raise RuntimeError(f"v50 smoke: clean control unexpectedly fired: {clean}")
+        raise RuntimeError(f"text smoke: clean control unexpectedly fired: {clean}")
     if not any(span["entity_group"] == "private_email" for span in long_tail):
-        raise RuntimeError("v50 smoke: overlapping windows dropped tail PII")
+        raise RuntimeError("text smoke: overlapping windows dropped tail PII")
+    if not any(span["entity_group"] == "secret" for span in bare_secret):
+        raise RuntimeError(f"text smoke: bare secret missed: {bare_secret}")
+    if not any(span["entity_group"] == "private_sensitive" for span in sensitive):
+        raise RuntimeError(f"text smoke: private_sensitive missed: {sensitive}")
 
     server._load_image_model()
     server._load_role_model()

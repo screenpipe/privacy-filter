@@ -25,9 +25,13 @@ import hashlib
 import json
 import os
 import shutil
+import urllib.request
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
+try:
+    from huggingface_hub import hf_hub_download
+except ImportError:  # pragma: no cover - optional when SOURCE_MODEL_BASE_URL is set
+    hf_hub_download = None  # type: ignore[assignment]
 
 
 # (filename, expected_sha256). These are the same hashes pinned by the
@@ -36,13 +40,13 @@ from huggingface_hub import hf_hub_download
 # swap weights inside an attested image.
 EXPECTED_SHA256: dict[str, str] = {
     "model_quantized.onnx":
-        "e67efa3a511108b6864db3cb19be37853524e6ed4f0f26cc041ecb822ba12e6e",
+        "c9e198972d97d8bbeb53ef57b8afb43cdb1607f36a01eda8abd55cfad6eafe4a",
     "tokenizer.json":
         "14c7e8bf7d9b58ca061fcda93bc8d0eedd1a51ffc3af01a1ba1ef54e2154887e",
     "config.json":
-        "ab11d9f79693e29c0d9f11de185e48d80462e95799030c37bfa08c14379a9244",
+        "dd71e14a04f1e0f84c76fa5f77e1d4db026b1b7b15192b41b255ca806cefe40f",
     "remap.json":
-        "334df93eb6843ecc7ea0939ab6450df4df203e21d5227bbcb9f7c2af19f98827",
+        "ab4f18f221e9e36ad2a94172e8360a0d163fa4ae3ee8a917df6e49c9df983d5f",
 }
 
 
@@ -55,32 +59,34 @@ def sha256_of(path: Path) -> str:
 
 
 def main() -> None:
-    src = os.environ["SOURCE_MODEL_ID"]                       # screenpipe/pii-redactor
+    base_url = (os.environ.get("SOURCE_MODEL_BASE_URL") or "").rstrip("/")
+    src = os.environ.get("SOURCE_MODEL_ID", "screenpipe/pii-redactor")
     revision = os.environ.get("SOURCE_MODEL_REVISION") or None
-    subfolder = os.environ.get("SOURCE_MODEL_SUBFOLDER")      # v50_distilled6l
+    subfolder = os.environ.get("SOURCE_MODEL_SUBFOLDER") or None
     out = Path(os.environ["MODEL_DIR"])
     out.mkdir(parents=True, exist_ok=True)
 
     for fname, expected_sha in EXPECTED_SHA256.items():
-        print(f"[build] downloading {fname} from {src}@{revision or 'main'}"
-              + (f"/{subfolder}" if subfolder else ""))
-        cached = hf_hub_download(
-            repo_id=src,
-            revision=revision,
-            subfolder=subfolder,
-            filename=fname,
-            local_dir=str(out),
-        )
-        # hf_hub_download preserves `subfolder` under local_dir — it writes to
-        # out/<subfolder>/<fname>. But the runtime (server.py::_load_model)
-        # loads MODEL_DIR *flat*: from_pretrained(MODEL_DIR) expects
-        # out/config.json, out/model_quantized.onnx, out/tokenizer.json.
-        # Flatten so the file lives directly at out/<fname>. (Regression from
-        # v0.6.0, which swapped snapshot_download(local_dir=out) — flat — for
-        # hf_hub_download(subfolder=...) — nested — and broke container boot.)
         final = out / fname
-        if Path(cached).resolve() != final.resolve():
-            shutil.copyfile(cached, final)
+        if base_url:
+            url = f"{base_url}/{fname}"
+            print(f"[build] downloading {fname} from {url}")
+            with urllib.request.urlopen(url, timeout=120) as resp, open(final, "wb") as dst:
+                shutil.copyfileobj(resp, dst)
+        else:
+            if hf_hub_download is None:
+                raise RuntimeError("huggingface_hub is required when SOURCE_MODEL_BASE_URL is unset")
+            print(f"[build] downloading {fname} from {src}@{revision or 'main'}"
+                  + (f"/{subfolder}" if subfolder else ""))
+            cached = hf_hub_download(
+                repo_id=src,
+                revision=revision,
+                subfolder=subfolder,
+                filename=fname,
+                local_dir=str(out),
+            )
+            if Path(cached).resolve() != final.resolve():
+                shutil.copyfile(cached, final)
         actual = sha256_of(final)
         if actual != expected_sha:
             raise RuntimeError(
@@ -92,8 +98,6 @@ def main() -> None:
                 f"build_download.py deliberately and rebuild."
             )
 
-    # Drop the now-redundant nested subfolder copy and the HF local-dir cache
-    # so the baked MODEL_DIR contains exactly the flat files the server loads.
     if subfolder:
         shutil.rmtree(out / subfolder, ignore_errors=True)
     shutil.rmtree(out / ".cache", ignore_errors=True)
@@ -101,6 +105,7 @@ def main() -> None:
     with open(out / "screenpipe_model_source.json", "w") as f:
         json.dump(
             {
+                "source_model_base_url": base_url or None,
                 "source_model_id": src,
                 "source_model_revision": revision,
                 "source_model_subfolder": subfolder,
@@ -111,7 +116,7 @@ def main() -> None:
             sort_keys=True,
         )
         f.write("\n")
-    print(f"[build] wrote v50_distilled6l ONNX contract to {out}")
+    print(f"[build] wrote {subfolder or 'text'} ONNX contract to {out}")
 
 
 if __name__ == "__main__":
