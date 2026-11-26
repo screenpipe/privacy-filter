@@ -6,7 +6,7 @@
 CPU-only HTTP service for two PII models in a Tinfoil confidential-compute enclave:
 
 1. [`screenpipe/pii-redactor`](https://huggingface.co/screenpipe/pii-redactor) (`v50_distilled6l`), the same hash-verified text checkpoint and vocabulary remap as the desktop app. Endpoint `POST /filter`.
-2. [`screenpipe/pii-image-redactor`](https://huggingface.co/screenpipe/pii-image-redactor) (`rfdetr_v38`), with the existing whole-frame plus four-tile screenshot policy. Endpoint `POST /image/detect`.
+2. `rfdetr_v108b` (`768×768` W16A32 vision detector) + `pii_role_fusion_v4` (zero-text OS accessibility role-fusion head), baked from pinned SHA-256-verified `models-static` weights with the whole-frame plus four-tile screenshot policy. Endpoint `POST /image/detect`.
 
 `tinfoil-config.yml` provisions 8 vCPUs, 16 GB RAM, and no GPU. `Dockerfile.cpu` includes ONNX Runtime CPU and neither generative-model weights nor CUDA. `PRIVACY_ONLY=true` skips both chat upstreams and makes readiness require both privacy models on CPU. The public shim exposes only the existing PII endpoints and health. Previously hosted Gemma and GLM routes are retired.
 
@@ -25,15 +25,17 @@ POST /filter         → {"text": "My email is alice@foo.com"}
                         "latency_ms": 180,
                         "model": "screenpipe/pii-redactor:v50_distilled6l (mixed-int4-int8-onnx)"}
 
-POST /image/detect   → {"image_b64": "<b64-jpg-or-png>", "threshold": 0.30}
+POST /image/detect   → {"image_b64": "<b64-jpg-or-png>", "threshold": 0.30,
+                        "ax_nodes": [{"role": "AXStaticText", "landmark": "main", "depth": 2,
+                                      "bounds": {"left": 0.36, "top": 0.40, "width": 0.18, "height": 0.03}}]}
                     ←  {"detections": [{"bbox": [x, y, w, h], "label": "private_person", "score": 0.95},
-                                       {"bbox": [x, y, w, h], "label": "secret",        "score": 0.91}],
-                        "latency_ms": 95, "model": "rfdetr_v38",
+                                       {"bbox": [x, y, w, h], "label": "secret",         "score": 0.91}],
+                        "latency_ms": 418, "model": "rfdetr_v108b+pii_role_fusion_v4",
                         "width": 2880, "height": 1800}
 
 ```
 
-Bbox is `[x, y, w, h]` in original-image pixel space (the server un-resizes from the model's 512×512 input). Labels are the canonical 12-class screenpipe PII taxonomy.
+Bbox is `[x, y, w, h]` in original-image pixel space (the server un-resizes from the model's 768×768 input; optional `ax_nodes` strip any raw text fields on ingress and fuse structural UI roles in ~1.4 ms CPU, falling back cleanly to pure vision when omitted). Labels are the canonical 12-class screenpipe PII taxonomy.
 
 ## Local development
 

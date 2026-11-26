@@ -5,6 +5,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import time
 
 import httpx
@@ -23,6 +24,11 @@ async def main():
             assert health.status_code == 200, health.text
             assert health.json()["text_provider"] == "CPUExecutionProvider"
             assert health.json()["image_provider"] == "CPUExecutionProvider"
+            pub_health = await client.get("/health")
+            assert pub_health.status_code == 200, pub_health.text
+            assert pub_health.json()["image_model_ready"] is True, pub_health.text
+            if server.ROLE_MODEL_PATH and os.path.exists(server.ROLE_MODEL_PATH):
+                assert pub_health.json()["role_model_ready"] is True, pub_health.text
             timings = {}
             text = "Contact Alice Smith at alice.smith@example.com or 415-555-0123."
             for _ in range(3):
@@ -35,11 +41,31 @@ async def main():
                 image = Image.new("RGB", (width, height), "white")
                 buffer = io.BytesIO()
                 image.save(buffer, format="PNG")
+                b64 = base64.b64encode(buffer.getvalue()).decode()
                 started = time.monotonic()
-                response = await client.post("/image/detect", json={"image_b64": base64.b64encode(buffer.getvalue()).decode()})
+                response = await client.post("/image/detect", json={"image_b64": b64})
                 assert response.status_code == 200, response.text
                 assert response.json()["width"] == width
                 timings[f"image_{width}x{height}_ms"] = round((time.monotonic()-started)*1000, 1)
+            # Smoke-test V4 text-free ax_nodes path (password control + role fusion if baked)
+            pw_buf = io.BytesIO()
+            Image.new("RGB", (1280, 800), "white").save(pw_buf, format="PNG")
+            ax_resp = await client.post(
+                "/image/detect",
+                json={
+                    "image_b64": base64.b64encode(pw_buf.getvalue()).decode(),
+                    "ax_nodes": [
+                        {
+                            "role": "AXSecureTextField",
+                            "depth": 1,
+                            "bounds": {"left": 0.2, "top": 0.4, "width": 0.25, "height": 0.04},
+                            "is_password": True,
+                        }
+                    ],
+                },
+            )
+            assert ax_resp.status_code == 200, ax_resp.text
+            assert any(d["label"] == "secret" for d in ax_resp.json()["detections"]), ax_resp.text
             print("CPU_SMOKE " + json.dumps(timings), flush=True)
     finally:
         await server.app.router.shutdown()

@@ -44,6 +44,22 @@ class ImageTilingTests(unittest.TestCase):
                 f"point {(point_x, point_y)} is uncovered",
             )
 
+    def test_v4_768_keeps_five_tiles_on_laptop_and_1080p_desktops(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(server, "IMAGE_INPUT_SIZE", 768):
+            # Sub-desktop crops (< 1024 x 768) still run a single whole-frame pass
+            self.assertEqual(
+                server._image_inference_windows(960, 720),
+                [(0, 0, 960, 720)],
+            )
+            # 1440x900, 1512x948, 1920x1080, and Retina/4K (>= 1024 x 768) union
+            # whole frame + 4 overlapping tiles (matching gen_preds.py & rfdetr.rs)
+            for w, h in ((1440, 900), (1512, 948), (1920, 1080), (2560, 1440)):
+                wins = server._image_inference_windows(w, h)
+                self.assertEqual(wins[0], (0, 0, w, h))
+                self.assertEqual(len(wins), 5, f"{w}x{h} must retain 2x2 tiling")
+
     def test_overlap_suppression_keeps_best_duplicate_and_distinct_box(self) -> None:
         duplicate_low = server.ImageDetection(
             bbox=[100, 100, 200, 40], label="private_email", score=0.71

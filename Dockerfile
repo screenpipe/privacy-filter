@@ -94,23 +94,24 @@ RUN useradd --system --no-create-home --uid 10001 appuser \
     && rm -rf /root/.cache/huggingface /tmp/build_download.py \
     && chown -R appuser:appuser $MODEL_DIR
 
-# Image-PII detector. Same auto-download pattern as before — baked at
-# build time with SHA-256 verification so the resulting image hash is
-# reproducible across rebuilds.
-# rfdetr_v38 = the real-screen-validated detector (512×512, ~60 MB).
-# It retains fp32 input/output around fp16 weights, so the existing numpy /
-# ONNX Runtime path remains compatible. The desktop and enclave now use the
-# same weights. server.py auto-detects the static input resolution at load.
-ARG IMAGE_MODEL_HF_REPO=screenpipe/pii-image-redactor
-ARG IMAGE_MODEL_REVISION=fa63646b0e67b216a59fe1cd22c8d9b6447af905
-ARG IMAGE_MODEL_HF_FILE=rfdetr_v38.onnx
-ARG IMAGE_MODEL_SHA256=0e968657aafcfb2c5d61ece264d5959ddeeec53091171fae226b45ecd3a8a880
-ENV IMAGE_MODEL_PATH=/opt/rfdetr_v38.onnx \
-    IMAGE_MODEL_ID="rfdetr_v38"
+# Image-PII V4 detector + zero-text accessibility role-fusion head.
+ARG IMAGE_MODELS_REPO=screenpipe/privacy-filter
+ARG IMAGE_MODELS_REVISION=6e3d5f7ea20ad43fab39a292c0f273ee13701c62
+ARG IMAGE_MODEL_FILE=rfdetr_v108b.onnx
+ARG IMAGE_MODEL_SHA256=884018d88343ab1ceb0aeb18f558bc76cac6fb7100f8760cdc28aed809e18dfd
+ARG ROLE_MODEL_FILE=pii_role_fusion_v4.onnx
+ARG ROLE_MODEL_SHA256=5dec3c65565b1229b40be401fb7246f962a8099694e0cefcf13f04555ca14789
+ENV IMAGE_MODEL_PATH=/opt/rfdetr_v108b.onnx \
+    IMAGE_MODEL_ID="rfdetr_v108b" \
+    ROLE_MODEL_PATH=/opt/pii_role_fusion_v4.onnx \
+    ROLE_MODEL_ID="pii_role_fusion_v4"
 ADD --checksum=sha256:${IMAGE_MODEL_SHA256} \
-    https://huggingface.co/${IMAGE_MODEL_HF_REPO}/resolve/${IMAGE_MODEL_REVISION}/${IMAGE_MODEL_HF_FILE} \
+    https://raw.githubusercontent.com/${IMAGE_MODELS_REPO}/${IMAGE_MODELS_REVISION}/${IMAGE_MODEL_FILE} \
     ${IMAGE_MODEL_PATH}
-RUN chown appuser:appuser ${IMAGE_MODEL_PATH}
+ADD --checksum=sha256:${ROLE_MODEL_SHA256} \
+    https://raw.githubusercontent.com/${IMAGE_MODELS_REPO}/${IMAGE_MODELS_REVISION}/${ROLE_MODEL_FILE} \
+    ${ROLE_MODEL_PATH}
+RUN chown appuser:appuser ${IMAGE_MODEL_PATH} ${ROLE_MODEL_PATH}
 
 # Gemma 4 E2B (BF16) — chat + vision + native audio. ~10 GB on disk.
 # We serve E2B (not E4B): it has the same native-audio capability but a
@@ -152,6 +153,7 @@ RUN python3 -c "from huggingface_hub import snapshot_download; \
 RUN pip install --no-cache-dir 'transformers==5.12.1' 'pydantic>=2.12,<3' \
  && python3 -c "import transformers; from transformers import Gemma3Config, Gemma4Config, AutoTokenizer; AutoTokenizer.from_pretrained('/opt/model'); print('dep-fix OK: transformers', transformers.__version__)"
 
+COPY --chown=appuser:appuser role_fusion.py /app/role_fusion.py
 COPY --chown=appuser:appuser server.py /app/server.py
 COPY --chown=appuser:appuser model_smoke.py /app/model_smoke.py
 COPY --chown=appuser:appuser proxy_smoke.py /app/proxy_smoke.py

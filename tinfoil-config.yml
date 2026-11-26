@@ -8,13 +8,14 @@ gpus: 0
 
 containers:
   - name: privacy-filter
-    image: "ghcr.io/screenpipe/privacy-filter:0.10.0-cpu.rc1@sha256:c303fb570ee5f3e1af88bc7ee54101979fdaac020855bbe7c490b5e30a43933f"
+    image: "ghcr.io/screenpipe/privacy-filter:0.11.0-cpu.rc2@sha256:09b8c8c9302c0f1d2b4a0e3c6623bd4909aa96f433d5c95141815974c52d6475"
     user: "10001:999"
     env:
       - PORT: "8080"
       - HOME: "/home/appuser"
       - PRIVACY_ONLY: "true"
       - ORT_NUM_THREADS: "4"
+      - IMAGE_MAX_CONCURRENCY: "2"
     tmpfs:
       /tmp: size=256m,mode=1777
       /home/appuser: size=64m,mode=0700,uid=10001,gid=999
