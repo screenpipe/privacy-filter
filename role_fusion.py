@@ -124,11 +124,15 @@ _ROLE_MAP = {
     "heading": "AXHeading",
     "axheading": "AXHeading",
     "table": "AXTable",
+    "datagrid": "AXTable",
     "axtable": "AXTable",
     "row": "AXRow",
     "listitem": "AXRow",
+    "treeitem": "AXRow",
     "axrow": "AXRow",
     "columnheader": "AXColumnHeader",
+    "header": "AXColumnHeader",
+    "headeritem": "AXColumnHeader",
     "axcolumnheader": "AXColumnHeader",
     "cell": "AXCell",
     "dataitem": "AXCell",
@@ -142,8 +146,14 @@ _ROLE_MAP = {
     "navigation": "AXNavigation",
     "axnavigation": "AXNavigation",
     "toolbar": "AXToolbar",
+    "menubar": "AXToolbar",
+    "axmenubar": "AXToolbar",
+    "titlebar": "AXToolbar",
+    "statusbar": "AXToolbar",
+    "appbar": "AXToolbar",
     "axtoolbar": "AXToolbar",
     "complementary": "AXComplementary",
+    "tree": "AXComplementary",
     "axcomplementary": "AXComplementary",
     "main": "AXMain",
     "document": "AXMain",
@@ -184,6 +194,50 @@ def _infer_landmark_from_role_or_subrole(role_norm: str, subrole: str) -> Option
     if "main" in sr or role_norm == "AXMain":
         return "main"
     return None
+
+
+def _clamp_viewport_bounds(raw_bounds: Any) -> Optional[Dict[str, float]]:
+    """Intersect normalized bounds with the [0, 1] monitor viewport.
+
+    Handles Windows UIA's unclamped -8px maximized window border (`left=-0.004,
+    width=1.008`) and partially scrolled/off-screen elements while rejecting
+    elements with zero visible area on the monitor.
+    """
+    if not isinstance(raw_bounds, dict):
+        return None
+    try:
+        raw_l = float(raw_bounds.get("left", raw_bounds.get("x", float("nan"))))
+        raw_t = float(raw_bounds.get("top", raw_bounds.get("y", float("nan"))))
+        raw_w = float(raw_bounds.get("width", raw_bounds.get("w", 0.0)))
+        raw_h = float(raw_bounds.get("height", raw_bounds.get("h", 0.0)))
+    except (TypeError, ValueError):
+        return None
+    if not (
+        math.isfinite(raw_l)
+        and math.isfinite(raw_t)
+        and math.isfinite(raw_w)
+        and math.isfinite(raw_h)
+    ) or raw_w <= 0.0 or raw_h <= 0.0:
+        return None
+    if (
+        raw_l >= 0.0
+        and raw_t >= 0.0
+        and raw_l + raw_w <= 1.001
+        and raw_t + raw_h <= 1.001
+    ):
+        return {
+            "left": raw_l,
+            "top": raw_t,
+            "width": min(raw_w, 1.0 - raw_l),
+            "height": min(raw_h, 1.0 - raw_t),
+        }
+    x1 = min(1.0, max(0.0, raw_l))
+    y1 = min(1.0, max(0.0, raw_t))
+    x2 = min(1.0, max(0.0, raw_l + raw_w))
+    y2 = min(1.0, max(0.0, raw_t + raw_h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return {"left": x1, "top": y1, "width": x2 - x1, "height": y2 - y1}
 
 
 def prepare_ax_nodes(raw_nodes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -230,7 +284,7 @@ def prepare_ax_nodes(raw_nodes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]
             "landmark": lm,
             "depth": depth,
             "parent_idx": parent_idx,
-            "bounds": n.get("bounds"),
+            "bounds": _clamp_viewport_bounds(n.get("bounds")),
             "is_editable": bool(n.get("is_editable", False)),
             "is_focused": bool(n.get("is_focused", False)),
             "is_selected": bool(n.get("is_selected", False)),
@@ -268,20 +322,10 @@ def forced_a11y_secret_regions(
         is_pw = bool(n.get("is_password")) or role == "AXSecureTextField"
         if not is_pw:
             continue
-        b = n.get("bounds") or {}
-        left = float(b.get("left", b.get("x", -1.0)))
-        top = float(b.get("top", b.get("y", -1.0)))
-        width = float(b.get("width", b.get("w", 0.0)))
-        height = float(b.get("height", b.get("h", 0.0)))
-        if (
-            left < 0.0
-            or top < 0.0
-            or width <= 0.0
-            or height <= 0.0
-            or left + width > 1.01
-            or top + height > 1.01
-        ):
+        cb = _clamp_viewport_bounds(n.get("bounds"))
+        if cb is None:
             continue
+        left, top, width, height = cb["left"], cb["top"], cb["width"], cb["height"]
         x1 = max(0, int(math.floor(left * img_w)) - 2)
         y1 = max(0, int(math.floor(top * img_h)) - 2)
         x2 = min(img_w, int(math.ceil((left + width) * img_w)) + 2)

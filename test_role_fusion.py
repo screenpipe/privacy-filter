@@ -98,6 +98,25 @@ class RoleFusionAndConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared[4]["parent_idx"], 3)
         self.assertEqual(prepared[4]["landmark"], "main")
 
+    def test_windows_uia_maximized_and_partial_offscreen_bounds_are_clamped_not_dropped(self) -> None:
+        raw = [
+            {"role": "Pane", "depth": 0, "bounds": {"left": -0.0042, "top": -0.0074, "width": 1.0084, "height": 1.0148}},
+            {"role": "TitleBar", "depth": 1, "bounds": {"left": -0.0042, "top": 0.0, "width": 1.0084, "height": 0.04}},
+            {"role": "DataGrid", "depth": 1, "bounds": {"left": 0.1, "top": 0.1, "width": 0.95, "height": 0.8}},
+            {"role": "PasswordBox", "depth": 2, "is_password": True, "bounds": {"left": -0.05, "top": 0.3, "width": 0.25, "height": 0.04}},
+            {"role": "Text", "depth": 2, "bounds": {"left": 1.15, "top": 0.3, "width": 0.2, "height": 0.03}},
+        ]
+        prepared = role_fusion.prepare_ax_nodes(raw)
+        self.assertEqual(prepared[0]["bounds"], {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0})
+        self.assertEqual(prepared[1]["landmark"], "toolbar")
+        self.assertEqual(prepared[2]["landmark"], "table")
+        self.assertAlmostEqual(prepared[3]["bounds"]["left"], 0.0, places=5)
+        self.assertAlmostEqual(prepared[3]["bounds"]["width"], 0.20, places=5)
+        self.assertIsNone(prepared[4]["bounds"])
+        forced = role_fusion.forced_a11y_secret_regions(prepared, 1920, 1080)
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(forced[0]["bbox"][0], 0)
+
     async def test_password_field_redacted_even_without_role_onnx(self) -> None:
         ax_nodes = [
             {
