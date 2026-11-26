@@ -59,6 +59,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoTokenizer
 
 import role_fusion
+import visual_pii
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
@@ -185,6 +186,7 @@ LABEL_TAG = {
     "secret": "SECRET",
     "private_sensitive": "SENSITIVE",
     "account_number": "ACCOUNT",
+    "qr_code": "QR_CODE",
 }
 
 # screenpipe-redact sends canonical `SpanLabel` snake_case names in the
@@ -208,6 +210,9 @@ CANONICAL_TO_MODEL = {
     "date": "private_date",
     "secret": "secret",
     "sensitive": "private_sensitive",
+    "qr_code": "qr_code",
+    "qrcode": "qr_code",
+    "qr": "qr_code",
 }
 
 
@@ -223,7 +228,11 @@ def _resolve_allowed_labels(labels: Optional[List[str]]) -> Optional[Set[str]]:
     allowed: Set[str] = set()
     for raw in labels:
         key = raw.strip().lower()
-        if key in CANONICAL_TO_MODEL:
+        if key == "all":
+            return None
+        if key == "visual":
+            allowed.add("qr_code")
+        elif key in CANONICAL_TO_MODEL:
             allowed.add(CANONICAL_TO_MODEL[key])
         elif key in LABEL_TAG:  # already a model label
             allowed.add(key)
@@ -340,6 +349,14 @@ class DetectRequest(BaseModel):
         max_length=MAX_AX_NODES,
         description="Optional text-free accessibility tree nodes for V4 role/context fusion.",
     )
+    strict_mode: bool = Field(
+        False,
+        description="Enable Enterprise Strict epistemic-uncertainty rescue + compact leaf container masking.",
+    )
+    detect_qr: bool = Field(
+        False,
+        description="Opt-in visual QR-code finder-pattern detector (zero overhead when False).",
+    )
 
 
 class ImageDetection(BaseModel):
@@ -354,6 +371,8 @@ class DetectResponse(BaseModel):
     model: str
     width: int
     height: int
+    uncertain_proposals_rescued: int = 0
+    max_epistemic_std: float = 0.0
 
 
 app = FastAPI(
@@ -1153,9 +1172,15 @@ def _detect_image_bytes(raw: bytes, req: DetectRequest) -> DetectResponse:
 
     # Per-field allow-list (canonical SpanLabel names). None = return all.
     allowed = _resolve_allowed_labels(req.labels)
+    qr_requested = bool(req.detect_qr) or any(
+        raw_lbl.strip().lower() in ("qr", "qrcode", "qr_code", "visual", "all")
+        for raw_lbl in (req.labels or [])
+    )
     orig_w, orig_h = img.size
     has_ax = bool(req.ax_nodes)
     t0 = time.time()
+    rescued_count = 0
+    max_ep_std = 0.0
 
     try:
         if has_ax:
@@ -1167,13 +1192,17 @@ def _detect_image_bytes(raw: bytes, req: DetectRequest) -> DetectResponse:
                 )
             nms_props = _suppress_raw_proposals(raw_props)
             ax_dicts = [n.model_dump(exclude_none=True) for n in (req.ax_nodes or [])]
-            fused = role_fusion.fuse_proposals_with_ax(
+            fused, fusion_stats = role_fusion.fuse_proposals_with_ax(
                 nms_props,
                 ax_dicts,
                 orig_w,
                 orig_h,
                 role_session=_role_session,
+                strict_uncertainty=bool(req.strict_mode),
+                return_stats=True,
             )
+            rescued_count = int(fusion_stats.get("uncertain_proposals_rescued", 0))
+            max_ep_std = float(fusion_stats.get("max_epistemic_std", 0.0))
             detections = []
             for r in fused:
                 score = float(r["score"])
@@ -1190,14 +1219,24 @@ def _detect_image_bytes(raw: bytes, req: DetectRequest) -> DetectResponse:
                         score=score,
                     )
                 )
-            detections = _suppress_image_overlaps(detections)
         else:
             detections = []
             for window in _image_inference_windows(orig_w, orig_h):
                 detections.extend(
                     _infer_image_window(img, window, req.threshold, allowed, np, Image)
                 )
-            detections = _suppress_image_overlaps(detections)
+
+        if qr_requested and (allowed is None or "qr_code" in allowed):
+            for qr_reg in visual_pii.detect_qr_regions(img):
+                detections.append(
+                    ImageDetection(
+                        bbox=[int(v) for v in qr_reg["bbox"]],
+                        label="qr_code",
+                        score=float(qr_reg["score"]),
+                    )
+                )
+
+        detections = _suppress_image_overlaps(detections)
     except HTTPException:
         raise
     except Exception as e:
@@ -1216,6 +1255,8 @@ def _detect_image_bytes(raw: bytes, req: DetectRequest) -> DetectResponse:
         model=model_used,
         width=orig_w,
         height=orig_h,
+        uncertain_proposals_rescued=rescued_count,
+        max_epistemic_std=max_ep_std,
     )
 
 

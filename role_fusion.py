@@ -79,6 +79,33 @@ NODE_FEAT_DIM = 42
 REL_FEAT_DIM = 6
 
 ROLE_PROPOSAL_FLOOR = 0.04
+STRICT_UNCERTAINTY_MIN_PROB = 0.16
+STRICT_UNCERTAINTY_MIN_STD = 0.065
+COMPACT_LEAF_MAX_AREA = 0.025
+COMPACT_LEAF_MAX_HEIGHT = 0.06
+
+_CHROME_OR_CONTROL_ROLES = {
+    "AXToolbar",
+    "AXNavigation",
+    "AXComplementary",
+    "AXButton",
+    "AXLink",
+    "AXTab",
+    "AXMenuItem",
+    "AXPopUpButton",
+    "AXComboBox",
+    "AXSearchField",
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXColumnHeader",
+}
+_CONTENT_LEAF_ROLES = {
+    "AXStaticText",
+    "AXCell",
+    "AXTextField",
+    "AXTextArea",
+}
+_CHROME_LANDMARKS = {"toolbar", "nav", "sidebar", "code"}
 
 CONTAINER_ROLES = {
     "AXGroup",
@@ -369,6 +396,113 @@ def find_enclosing_leaf_bounds(
             best_area = nw * nh
             best_leaf = (nx1, ny1, nx2, ny2)
     return best_leaf
+
+
+def find_enclosing_content_leaf(
+    bbox: Sequence[float],
+    a11y_nodes: Sequence[Dict[str, Any]],
+    img_w: int,
+    img_h: int,
+) -> Optional[Optional[List[int]]]:
+    """Check whether `bbox` sits inside a non-chrome content leaf.
+
+    Returns:
+      - `None` if `bbox` is NOT inside a valid non-chrome content leaf
+        (`AXStaticText`, `AXCell`, `AXTextField`, `AXTextArea` inside `main`,
+        `article`, or a `table` data row; never `toolbar`, `nav`, `sidebar`,
+        `AXButton`, `AXTab`, or `AXColumnHeader`).
+      - `[ix1, iy1, iw, ih]` ( wrapped in a 1-tuple `(compact_bbox,)` below )
+        Wait: to distinguish "valid non-compact leaf" from "rejected", returns a
+        dict `{"compact_bbox": Optional[List[int]]}` when valid, or `None` when
+        rejected.
+    """
+    if img_w <= 0 or img_h <= 0 or not a11y_nodes:
+        return None
+    bx, by = float(bbox[0]), float(bbox[1])
+    bw, bh = max(float(bbox[2]), 1.0), max(float(bbox[3]), 1.0)
+    x1, y1, x2, y2 = bx, by, bx + bw, by + bh
+
+    best_idx = -1
+    best_area = 1e18
+    for idx, n in enumerate(a11y_nodes):
+        role = normalize_role(str(n.get("role") or "AXGroup"))
+        if role in CONTAINER_ROLES:
+            continue
+        b = n.get("bounds") or {}
+        nx1 = float(b.get("left", b.get("x", 0.0))) * img_w
+        ny1 = float(b.get("top", b.get("y", 0.0))) * img_h
+        nw = float(b.get("width", b.get("w", 0.0))) * img_w
+        nh = float(b.get("height", b.get("h", 0.0))) * img_h
+        if nw <= 2.0 or nh <= 2.0:
+            continue
+        nx2, ny2 = nx1 + nw, ny1 + nh
+        ix = max(0.0, min(x2, nx2) - max(x1, nx1))
+        iy = max(0.0, min(y2, ny2) - max(y1, ny1))
+        area = nw * nh
+        if (ix * iy) / max(bw * bh, 1.0) >= 0.50 and area < best_area:
+            best_area = area
+            best_idx = idx
+
+    if best_idx < 0:
+        return None
+
+    leaf = a11y_nodes[best_idx]
+    leaf_role = normalize_role(str(leaf.get("role") or "AXGroup"))
+    if leaf_role not in _CONTENT_LEAF_ROLES:
+        return None
+
+    leaf_lm = str(leaf.get("landmark") or "root").strip().lower()
+    in_main_or_article = leaf_lm in ("main", "article")
+    in_table_data = leaf_role == "AXCell" or leaf_lm == "table"
+
+    cur_idx: Optional[int] = best_idx
+    visited = set()
+    hops = 0
+    while cur_idx is not None and 0 <= cur_idx < len(a11y_nodes) and hops < 16:
+        if cur_idx in visited:
+            break
+        visited.add(cur_idx)
+        hops += 1
+
+        node = a11y_nodes[cur_idx]
+        r_norm = normalize_role(str(node.get("role") or "AXGroup"))
+        lm_norm = str(node.get("landmark") or "root").strip().lower()
+        if r_norm in _CHROME_OR_CONTROL_ROLES or lm_norm in _CHROME_LANDMARKS:
+            return None
+        if r_norm in ("AXMain", "AXArticle") or lm_norm in ("main", "article"):
+            in_main_or_article = True
+        if r_norm in ("AXCell", "AXRow", "AXTable"):
+            in_table_data = True
+        if r_norm == "AXRow":
+            # Reject table header rows whose children include `AXColumnHeader`.
+            row_idx = cur_idx
+            for ch in a11y_nodes:
+                if int(ch.get("parent_idx", -1)) == row_idx and normalize_role(
+                    str(ch.get("role") or "")
+                ) == "AXColumnHeader":
+                    return None
+
+        p_idx = int(node.get("parent_idx", -1))
+        cur_idx = p_idx if 0 <= p_idx < len(a11y_nodes) else None
+
+    if not (in_main_or_article or in_table_data):
+        return None
+
+    b = leaf.get("bounds") or {}
+    norm_l = float(b.get("left", b.get("x", 0.0)))
+    norm_t = float(b.get("top", b.get("y", 0.0)))
+    norm_w = float(b.get("width", b.get("w", 0.0)))
+    norm_h = float(b.get("height", b.get("h", 0.0)))
+    compact_bbox: Optional[List[int]] = None
+    if (norm_w * norm_h) <= COMPACT_LEAF_MAX_AREA and norm_h <= COMPACT_LEAF_MAX_HEIGHT:
+        ix1 = max(0, int(math.floor(norm_l * img_w + 1e-4)))
+        iy1 = max(0, int(math.floor(norm_t * img_h + 1e-4)))
+        ix2 = min(img_w, max(ix1 + 1, int(math.ceil((norm_l + norm_w) * img_w - 1e-4))))
+        iy2 = min(img_h, max(iy1 + 1, int(math.ceil((norm_t + norm_h) * img_h - 1e-4))))
+        if ix2 > ix1 and iy2 > iy1:
+            compact_bbox = [ix1, iy1, ix2 - ix1, iy2 - iy1]
+
+    return {"compact_bbox": compact_bbox}  # type: ignore[return-value]
 
 
 def featurize_frame_v46(
@@ -876,25 +1010,35 @@ def fuse_proposals_with_ax(
     delta_scale: float = 1.35,
     inward_min_width_px: float = 96.0,
     para_max_h_px: float = 0.8,
-) -> List[Dict[str, Any]]:
+    strict_uncertainty: bool = False,
+    return_stats: bool = False,
+) -> Any:
     """Fuse vision proposals with structural accessibility nodes.
 
     - If `raw_ax_nodes` is empty, returns `proposals` unchanged.
     - If `role_session` is None (role ONNX not loaded), still unions deterministic
       `forced_a11y_secret_regions` (`is_password` / `AXSecureTextField` -> `secret`).
+    - When `strict_uncertainty=True`, promotes borderline proposals
+      (`keep_prob in [0.16, keep_gate)` and `epistemic_std >= 0.065`) inside
+      non-chrome content leaves and snaps compact leaves (`area <= 0.025` and
+      `height <= 0.06`) to their enclosing `AxNode` bounds.
+    - When `return_stats=True`, returns `(regions, stats_dict)`.
     """
+    empty_stats = {"uncertain_proposals_rescued": 0, "max_epistemic_std": 0.0}
     if not raw_ax_nodes:
-        return [
+        passthrough = [
             {"bbox": list(p["bbox"]), "label": p["label"], "score": float(p["score"])}
             for p in proposals
         ]
+        return (passthrough, empty_stats) if return_stats else passthrough
 
     ax_nodes = prepare_ax_nodes(raw_ax_nodes)
     if not ax_nodes:
-        return [
+        passthrough = [
             {"bbox": list(p["bbox"]), "label": p["label"], "score": float(p["score"])}
             for p in proposals
         ]
+        return (passthrough, empty_stats) if return_stats else passthrough
 
     if role_session is None:
         merged = [
@@ -904,9 +1048,13 @@ def fuse_proposals_with_ax(
         for forced in forced_a11y_secret_regions(ax_nodes, img_w, img_h):
             if not any(iou_xywh(forced["bbox"], nr["bbox"]) >= 0.30 for nr in merged):
                 merged.append(forced)
-        return merged
+        return (merged, empty_stats) if return_stats else merged
 
     bf, nf, rf, sorted_props = featurize_frame_v46(proposals, ax_nodes, img_w, img_h)
+    if not sorted_props:
+        forced_only = forced_a11y_secret_regions(ax_nodes, img_w, img_h)
+        return (forced_only, empty_stats) if return_stats else forced_only
+
     kp, std_p, b_del = role_session.run(
         ["keep_prob", "epistemic_std", "box_delta"],
         {"box_feats": bf[None], "node_feats": nf[None], "rel_feats": rf[None]},
@@ -915,17 +1063,43 @@ def fuse_proposals_with_ax(
 
     raw_regions: List[Dict[str, Any]] = []
     raw_deltas: List[np.ndarray] = []
+    snapped_overrides: List[Optional[List[int]]] = []
+    rescued_count = 0
+    max_ep_std = 0.0
 
     for i, pr in enumerate(sorted_props):
         vis_s = float(pr["score"])
         role_p = float(kp_np[i])
         ep_std = float(std_np[i])
+        max_ep_std = max(max_ep_std, ep_std)
+        snapped_bbox: Optional[List[int]] = None
 
         if boost_gate is not None and role_p >= boost_gate and ep_std <= 0.16 and vis_s >= 0.065:
             boosted = 0.52 + 0.42 * ((role_p - boost_gate) / max(1.0 - boost_gate, 1e-4))
             new_s = min(0.999, max(vis_s * (0.96 + 0.12 * role_p), boosted))
         elif role_p >= keep_gate:
             new_s = min(0.999, vis_s * (0.96 + 0.12 * role_p))
+        elif (
+            strict_uncertainty
+            and STRICT_UNCERTAINTY_MIN_PROB <= role_p < keep_gate
+            and ep_std >= STRICT_UNCERTAINTY_MIN_STD
+        ):
+            leaf_hit = find_enclosing_content_leaf(pr["bbox"], ax_nodes, img_w, img_h)
+            if leaf_hit is not None:
+                rescued_count += 1
+                snapped_bbox = leaf_hit["compact_bbox"]  # type: ignore[index]
+                band_t = min(
+                    1.0,
+                    max(
+                        0.0,
+                        (role_p - STRICT_UNCERTAINTY_MIN_PROB)
+                        / max(keep_gate - STRICT_UNCERTAINTY_MIN_PROB, 1e-4),
+                    ),
+                )
+                new_s = min(0.999, max(0.50 + 0.22 * band_t, vis_s * (0.96 + 0.12 * role_p)))
+            else:
+                ratio = role_p / max(keep_gate, 1e-4)
+                new_s = min(0.285, vis_s * 0.45) * ratio
         else:
             ratio = role_p / max(keep_gate, 1e-4)
             new_s = min(0.285, vis_s * 0.45) * ratio
@@ -939,6 +1113,7 @@ def fuse_proposals_with_ax(
                 }
             )
             raw_deltas.append(del_np[i])
+            snapped_overrides.append(snapped_bbox)
 
     new_regions = apply_monotonic_safe_delta(
         raw_regions,
@@ -950,9 +1125,16 @@ def fuse_proposals_with_ax(
         inward_min_width_px=inward_min_width_px,
         para_max_h_px=para_max_h_px,
     )
+    for idx, sb in enumerate(snapped_overrides):
+        if sb is not None:
+            new_regions[idx]["bbox"] = list(sb)
 
     for forced in forced_a11y_secret_regions(ax_nodes, img_w, img_h):
         if not any(iou_xywh(forced["bbox"], nr["bbox"]) >= 0.30 for nr in new_regions):
             new_regions.append(forced)
 
-    return new_regions
+    stats = {
+        "uncertain_proposals_rescued": rescued_count,
+        "max_epistemic_std": round(float(max_ep_std), 6),
+    }
+    return (new_regions, stats) if return_stats else new_regions

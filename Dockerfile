@@ -154,6 +154,7 @@ RUN pip install --no-cache-dir 'transformers==5.12.1' 'pydantic>=2.12,<3' \
  && python3 -c "import transformers; from transformers import Gemma3Config, Gemma4Config, AutoTokenizer; AutoTokenizer.from_pretrained('/opt/model'); print('dep-fix OK: transformers', transformers.__version__)"
 
 COPY --chown=appuser:appuser role_fusion.py /app/role_fusion.py
+COPY --chown=appuser:appuser visual_pii.py /app/visual_pii.py
 COPY --chown=appuser:appuser server.py /app/server.py
 COPY --chown=appuser:appuser model_smoke.py /app/model_smoke.py
 COPY --chown=appuser:appuser proxy_smoke.py /app/proxy_smoke.py

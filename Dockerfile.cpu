@@ -45,7 +45,7 @@ ADD --checksum=sha256:${ROLE_MODEL_SHA256} \
 RUN chown appuser:appuser ${IMAGE_MODEL_PATH} ${ROLE_MODEL_PATH}
 
 
-COPY role_fusion.py server.py test_image_tiling.py test_cpu_mode.py test_role_fusion.py cpu_smoke.py /app/
+COPY role_fusion.py visual_pii.py server.py test_image_tiling.py test_cpu_mode.py test_role_fusion.py cpu_smoke.py /app/
 RUN python3 -m unittest test_cpu_mode test_image_tiling test_role_fusion -v && python3 cpu_smoke.py
 USER 10001
 EXPOSE 8080
