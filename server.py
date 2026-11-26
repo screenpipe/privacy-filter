@@ -64,7 +64,7 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 # Kept as a display-only label for /health + response metadata.
 MODEL_ID = os.environ.get(
     "MODEL_ID",
-    "screenpipe/pii-redactor:v50_distilled6l (mixed-int4-int8-onnx)",
+    "screenpipe/pii-redactor:v52_multilingual_sensitive_int8 (qint8-onnx)",
 )
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "100000"))  # ~25K tokens
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "8192"))
@@ -824,49 +824,58 @@ def _opf_on_batch(texts: List[str]) -> List[List[dict]]:
         texts,
         return_offsets_mapping=True,
         return_overflowing_tokens=True,
-        return_tensors="np",
         truncation=True,
-        padding=True,
+        padding=False,
         max_length=WIN,
         stride=STRIDE,
     )
-    sample_of = enc["overflow_to_sample_mapping"].tolist()   # window -> source-text index
-    offsets = enc["offset_mapping"]                          # (W, T, 2) char offsets into source text
-    feed = {}
-    for model_input in _session.get_inputs():
-        if model_input.name not in enc:
-            continue
-        values = enc[model_input.name].astype(np.int64)
-        if model_input.name == "input_ids":
-            # Vectorized full-vocab → pruned-row mapping. Keep an explicit
-            # bounds fallback even though tokenizer ids should always fit the
-            # lookup; malformed/custom tokenizers must fail closed to UNK, not
-            # index outside the table or reach an invalid embedding row.
-            valid = (values >= 0) & (values < len(_token_id_remap))
-            remapped = np.full(values.shape, _token_id_unk, dtype=np.int64)
-            remapped[valid] = _token_id_remap[values[valid]]
-            values = remapped
-        feed[model_input.name] = values
-    logits = _session.run(None, feed)[0]                     # (W, T, C)
-    shifted = logits - logits.max(axis=-1, keepdims=True)
-    probs = np.exp(shifted)
-    probs /= probs.sum(axis=-1, keepdims=True)
-    pred = logits.argmax(axis=-1)                            # (W, T)
+    sample_of = list(enc["overflow_to_sample_mapping"])      # window -> source-text index
+    offsets_list = enc["offset_mapping"]                     # list of (T_w, 2) char offsets
+    input_names = [mi.name for mi in _session.get_inputs() if mi.name in enc]
+
+    # Run windows grouped by exact sequence length (100% unpadded). On QInt8
+    # DynamicQuantizeLinear graphs, padding short strings to 256 tokens both
+    # wastes up to 20x CPU FLOPs on <pad> tokens and shifts per-tensor dynamic
+    # activation scales relative to desktop `onnx.rs` unpadded windows.
+    by_len: dict[int, List[int]] = {}
+    for w_idx, ids_w in enumerate(enc["input_ids"]):
+        by_len.setdefault(len(ids_w), []).append(w_idx)
 
     per_text: List[List[dict]] = [[] for _ in texts]
-    for w in range(pred.shape[0]):
+    win_preds: dict[int, tuple] = {}
+    for seq_len, w_indices in by_len.items():
+        feed = {}
+        for name in input_names:
+            values = np.asarray([enc[name][wi] for wi in w_indices], dtype=np.int64)
+            if name == "input_ids":
+                valid = (values >= 0) & (values < len(_token_id_remap))
+                remapped = np.full(values.shape, _token_id_unk, dtype=np.int64)
+                remapped[valid] = _token_id_remap[values[valid]]
+                values = remapped
+            feed[name] = values
+        logits_g = _session.run(None, feed)[0]               # (G, T_len, C)
+        shifted_g = logits_g - logits_g.max(axis=-1, keepdims=True)
+        probs_g = np.exp(shifted_g)
+        probs_g /= probs_g.sum(axis=-1, keepdims=True)
+        pred_g = logits_g.argmax(axis=-1)
+        for gi, wi in enumerate(w_indices):
+            win_preds[wi] = (pred_g[gi], probs_g[gi])
+
+    for w in range(len(sample_of)):
         si = sample_of[w]
+        pred_w, probs_w = win_preds[w]
         cur: Optional[dict] = None
-        for t, (s, e) in enumerate(offsets[w].tolist()):
-            if s == e:                                       # special / padding token
+        for t, (s, e) in enumerate(offsets_list[w]):
+            if s == e:                                       # special token
                 cur = None
                 continue
-            label = _id2label[int(pred[w, t])]
+            p_id = int(pred_w[t])
+            label = _id2label[p_id]
             if label == "O":
                 cur = None
                 continue
             base = label.split("-", 1)[-1]                   # strip B-/I-
-            score = float(probs[w, t, pred[w, t]])
+            score = float(probs_w[t, p_id])
             if cur is not None and cur["entity_group"] == base and not label.startswith("B-") and s <= cur["end"]:
                 cur["end"] = int(e)
                 cur["_scores"].append(score)

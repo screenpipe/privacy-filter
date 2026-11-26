@@ -7,13 +7,15 @@ WORKDIR /app
 COPY requirements.cpu.txt /app/requirements.cpu.txt
 RUN pip install --no-cache-dir -r requirements.cpu.txt
 ARG SOURCE_MODEL_ID=screenpipe/pii-redactor
-ARG SOURCE_MODEL_REVISION=5c907008e2a2ad394712496a26819ad28dd44662
-ARG SOURCE_MODEL_SUBFOLDER=v50_distilled6l
+ARG SOURCE_MODEL_REVISION=c6421b1beb13d6014632f6d498c81113bee57cbd
+ARG SOURCE_MODEL_SUBFOLDER=v52_multilingual_sensitive_int8
+ARG SOURCE_MODEL_BASE_URL=https://raw.githubusercontent.com/screenpipe/privacy-filter/${SOURCE_MODEL_REVISION}/${SOURCE_MODEL_SUBFOLDER}
 ENV MODEL_DIR=/opt/model \
-    MODEL_ID="screenpipe/pii-redactor:v50_distilled6l (mixed-int4-int8-onnx)"
+    MODEL_ID="screenpipe/pii-redactor:v52_multilingual_sensitive_int8 (qint8-onnx)"
 COPY build_download.py /tmp/build_download.py
 RUN useradd --system --no-create-home --uid 10001 appuser \
-    && SOURCE_MODEL_ID=$SOURCE_MODEL_ID \
+    && SOURCE_MODEL_BASE_URL=$SOURCE_MODEL_BASE_URL \
+       SOURCE_MODEL_ID=$SOURCE_MODEL_ID \
        SOURCE_MODEL_REVISION=$SOURCE_MODEL_REVISION \
        SOURCE_MODEL_SUBFOLDER=$SOURCE_MODEL_SUBFOLDER \
        MODEL_DIR=$MODEL_DIR \
